@@ -118,3 +118,30 @@ def test_bridge_sends_all_notes_off_before_shutdown() -> None:
     writes = [json.loads(line) for line in created[0].stdin.lines]
     assert writes == [{"type": "all_notes_off"}, {"type": "shutdown"}]
     assert created[0].stdin.closed
+
+
+def test_bridge_applies_and_replays_patch_on_restart() -> None:
+    created: list[FakeProcess] = []
+
+    def process_factory(command: list[str], **kwargs: Any) -> FakeProcess:
+        process = FakeProcess()
+        created.append(process)
+        return process
+
+    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    bridge.apply_patch({"cutoff_hz": 2400.0, "drive": 2.0})
+
+    bridge.start()
+    first_writes = [json.loads(line) for line in created[0].stdin.lines]
+    assert first_writes == [
+        {"type": "set_param", "name": "cutoff_hz", "value": 2400.0},
+        {"type": "set_param", "name": "drive", "value": 2.0},
+    ]
+
+    created[0].returncode = 0
+    bridge.start()
+    second_writes = [json.loads(line) for line in created[1].stdin.lines]
+    assert second_writes == [
+        {"type": "set_param", "name": "cutoff_hz", "value": 2400.0},
+        {"type": "set_param", "name": "drive", "value": 2.0},
+    ]

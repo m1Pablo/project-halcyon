@@ -19,15 +19,16 @@ Footer {
 }
 
 #title {
-    height: 2;
+    height: 1;
     content-align: left middle;
     text-style: bold;
     color: #f0b429;
 }
 
 #workspace {
-    height: 1fr;
-    min-height: 7;
+    height: 10;
+    min-height: 10;
+    max-height: 10;
     width: 100%;
     layout: horizontal;
 }
@@ -47,31 +48,33 @@ Footer {
 }
 
 #status {
-    height: 6;
-    padding: 1;
+    height: 4;
+    padding: 0 1;
     border: solid #3a4450;
     background: #171b21;
 }
 
 #audio-status {
-    height: 5;
-    padding: 1;
+    height: 3;
+    padding: 0 1;
     border: solid #3a4450;
     background: #171b21;
 }
 
 .section-title {
     height: 1;
-    margin-top: 1;
+    margin-top: 0;
     margin-bottom: 0;
     color: #95d5b2;
     text-style: bold;
     content-align: left middle;
 }
 
+#input-title,
 #log-title {
+    margin-top: 0;
     margin-left: 0;
-    padding-left: 1;
+    padding-left: 0;
 }
 
 #keyboard-title {
@@ -81,7 +84,7 @@ Footer {
 #keyboard-scroll {
     width: 100%;
     max-width: 212;
-    height: 13;
+    height: 11;
     border: solid #3a4450;
     background: #171b21;
     overflow-x: auto;
@@ -90,9 +93,153 @@ Footer {
 
 #keyboard {
     width: 527;
-    height: 11;
+    height: 9;
     padding: 0;
     background: #171b21;
+}
+
+#synth-rack {
+    height: 13;
+    border: solid #3a4450;
+    background: #181d22;
+    padding: 0 1;
+}
+
+.synth-rack-inner {
+    height: 100%;
+}
+
+#knob-row {
+    height: 8;
+    align-horizontal: left;
+}
+
+SynthKnob {
+    width: 18;
+    height: 7;
+    margin-right: 1;
+    padding: 0 1;
+    color: #e7eadf;
+    background: #222932;
+    border: round #4d5b66;
+}
+
+SynthKnob:focus {
+    border: round #e0a458;
+    background: #2c333b;
+}
+
+.knob-label {
+    height: 1;
+    content-align: center middle;
+    text-style: bold;
+    color: #f1f5dc;
+}
+
+.knob-value {
+    height: 1;
+    content-align: center middle;
+    color: #95d5b2;
+}
+
+.knob-adjust-row {
+    height: 3;
+    width: 100%;
+    align-horizontal: center;
+}
+
+.knob-step {
+    width: 3;
+    min-width: 3;
+    height: 3;
+    content-align: center middle;
+    background: #253141;
+    color: #eceff4;
+}
+
+.knob-meter {
+    width: 1fr;
+    height: 3;
+    content-align: center middle;
+    background: #171b21;
+    color: #e0a458;
+}
+
+#preset-row {
+    height: 4;
+    padding-top: 0;
+    align-horizontal: left;
+}
+
+#preset-row Button {
+    width: 12;
+    min-width: 10;
+    height: 3;
+    margin-right: 1;
+    content-align: center middle;
+    background: #253141;
+    color: #e7eadf;
+}
+
+#preset-save {
+    width: 11;
+    background: #334155;
+}
+
+#preset-save.save-armed {
+    background: #684b24;
+    color: #fff4d6;
+}
+
+#preset-row Button.empty-preset {
+    color: #a7b1bc;
+    background: #202833;
+}
+
+#preset-row Button.saved-preset {
+    color: #f1f5dc;
+    background: #2e3f34;
+}
+
+#chat-panel {
+    height: 1fr;
+    min-height: 8;
+    border: solid #3a4450;
+    background: #15191e;
+}
+
+#chat-log {
+    height: 1fr;
+    padding: 0 1;
+    background: #15191e;
+}
+
+#chat-input-row {
+    height: 3;
+    width: 100%;
+    border-top: solid #3a4450;
+    background: #101418;
+}
+
+#chat-prompt {
+    width: 6;
+    height: 3;
+    content-align: center middle;
+    color: #95d5b2;
+    text-style: bold;
+}
+
+#chat-input {
+    width: 1fr;
+    height: 3;
+    border: none;
+    background: #101418;
+}
+
+#chat-send {
+    width: 9;
+    min-width: 8;
+    height: 3;
 }
 
 #event-log {

@@ -47,6 +47,9 @@ Near-term target:
 - Show a virtual keyboard with pressed/released key state.
 - Sound output is not required for the first Textual iteration.
 - The next iteration adds Rust sound output through `halcyon-audio/`; Python remains the MIDI/UI control plane.
+- Current synth controls are Python-owned patch state streamed to Rust via `set_param`; keep the parameter registry in `halcyon/synth_params.py` as the UI/tooling source of truth.
+- User synth presets are saved outside the repository through `halcyon/preset_store.py`.
+- The OpenAI assistant and local MCP bridge may only expose the safe synth tools in `halcyon/mcp_tools.py`, including preset save/load but no shell, file, MIDI-device, or arbitrary network access.
 
 ## Validation Policy
 
@@ -78,7 +81,11 @@ Until the repo has a full test harness, run the narrowest available `uv run ...`
 - Keep MIDI hardware optional in tests; use mocks or synthetic events.
 - Prefer the real Bluetooth MIDI path at runtime. The primary controller is an Akai Professional LPK25 Wireless.
 - Rust audio receives normalized events from Python over newline-delimited JSON stdin; do not duplicate MIDI device ownership in Rust until a later spec says so.
+- Rust also receives synth parameter changes from Python over the same stdin protocol; replay the current patch after sidecar restart/reconnect.
 - Keep audio callback code realtime-safe: no blocking calls, logging, heap allocation, or locks in the CPAL callback.
+- Keep OpenAI usage environment-only. Do not read `.env`, print API keys, or use live OpenAI calls in automated tests.
+- Local MCP control must bind to `127.0.0.1` and expose only synth state/parameter/preset/all-notes-off tools.
+- Preset persistence must keep built-in presets read-only and write user presets outside the repo unless a test explicitly overrides `HALCYON_PRESETS_PATH`.
 - Textual CSS is not web CSS. Verify with the Textual app, not browser assumptions.
 - Do not commit secrets, generated logs, local plans, or downloaded third-party skill copies.
 - Do not commit local editor settings such as `.vscode/`.
