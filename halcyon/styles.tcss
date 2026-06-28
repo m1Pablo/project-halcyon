@@ -53,6 +53,13 @@ Footer {
     background: #171b21;
 }
 
+#audio-status {
+    height: 5;
+    padding: 1;
+    border: solid #3a4450;
+    background: #171b21;
+}
+
 .section-title {
     height: 1;
     margin-top: 1;

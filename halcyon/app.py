@@ -9,6 +9,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical
 from textual.widgets import DataTable, Footer, Header, Static
 
+from halcyon.audio_bridge import RustAudioBridge
 from halcyon.keyboard import keyboard_text, scroll_target_for_note
 from halcyon.logs import MidiEventLog
 from halcyon.midi import MidiEvent, MidiInput, MidiUnavailable
@@ -38,11 +39,13 @@ class HalcyonApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.midi = MidiInput()
+        self.audio = RustAudioBridge()
         self.pressed_notes: set[int] = set()
         self.target_notes: set[int] = set()
         self.event_log = MidiEventLog(max_events=200)
         self.event_count = 0
         self.status = Static("Starting MIDI monitor...", id="status")
+        self.audio_status = Static("Audio: starting Rust sidecar...", id="audio-status")
         self.keyboard = VirtualKeyboard(id="keyboard")
         self.keyboard_scroll = HorizontalScroll(id="keyboard-scroll")
         self.event_table = DataTable(id="event-log", zebra_stripes=True)
@@ -54,6 +57,8 @@ class HalcyonApp(App[None]):
             with Horizontal(id="workspace"):
                 with Vertical(id="monitor-panel"):
                     yield self.status
+                    yield Static("Audio sidecar", id="audio-title", classes="section-title")
+                    yield self.audio_status
                 with Vertical(id="log-panel"):
                     yield Static("MIDI event log", id="log-title", classes="section-title")
                     yield self.event_table
@@ -74,13 +79,17 @@ class HalcyonApp(App[None]):
             "Time", "Event", "Note", "Vel", "Ch", "Status", "Delta", "Source"
         )
         self.keyboard.update_keys(self.pressed_notes)
+        self._start_audio()
         self._connect_midi()
         self.set_interval(0.02, self._poll_midi)
+        self.set_interval(0.5, self._refresh_audio_status)
 
     def on_shutdown(self) -> None:
+        self.audio.close()
         self.midi.close()
 
     def action_reconnect(self) -> None:
+        self.audio.all_notes_off()
         self._connect_midi()
 
     def action_clear_log(self) -> None:
@@ -102,6 +111,13 @@ class HalcyonApp(App[None]):
         port_list = ", ".join(ports) if ports else "none"
         self.status.update(f"Input: {port}\nAvailable: {port_list}")
 
+    def _start_audio(self) -> None:
+        self.audio.start()
+        self._refresh_audio_status()
+
+    def _refresh_audio_status(self) -> None:
+        self.audio_status.update(self.audio.snapshot().text)
+
     def _poll_midi(self) -> None:
         if not self.midi.connected:
             return
@@ -110,6 +126,7 @@ class HalcyonApp(App[None]):
             events = self.midi.poll()
         except Exception as exc:
             self.status.update(f"[error] MIDI polling failed: {exc}. Press r to reconnect.")
+            self.audio.all_notes_off()
             self.midi.close()
             return
 
@@ -122,6 +139,7 @@ class HalcyonApp(App[None]):
         elif event.is_release:
             self.pressed_notes.discard(event.note)
 
+        self.audio.handle_midi_event(event)
         self.keyboard.update_keys(self.pressed_notes, self.target_notes)
         if event.is_press:
             self._scroll_keyboard_to(event.note)

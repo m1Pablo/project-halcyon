@@ -5,6 +5,7 @@ __pycache__/
 .vscode/
 .pytest_cache/
 .ruff_cache/
+**/target/
 
 # Local secrets and environment files.
 secrets.txt

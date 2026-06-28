@@ -11,6 +11,7 @@ Project Halcyon is a Python MIDI controller/synth/drum experiment moving from a 
 - `Modules/midi.py` - MIDI port listing and polling helpers.
 - `Modules/synth.py` - original synth flow, currently incomplete.
 - `halcyon/` - new package location for the next Textual iteration.
+- `halcyon-audio/` - Rust workspace for the realtime oscillator sidecar and DSP core.
 - `.codex/agents/` - Codex-native workflow roles.
 - `.codex/commands/` - reusable local command notes.
 - `.codex/skills/` - local workflow skills and synced Context Engineering skills.
@@ -45,6 +46,7 @@ Near-term target:
 - Log MIDI input events clearly: event type, note, velocity, channel/status, delta time, and source port.
 - Show a virtual keyboard with pressed/released key state.
 - Sound output is not required for the first Textual iteration.
+- The next iteration adds Rust sound output through `halcyon-audio/`; Python remains the MIDI/UI control plane.
 
 ## Validation Policy
 
@@ -56,6 +58,9 @@ Run checks appropriate to the change scope before reporting completion:
 uv run ruff format
 uv run ruff check
 uv run pytest
+uv run -- cargo fmt --all --check --manifest-path halcyon-audio/Cargo.toml
+uv run -- cargo clippy --manifest-path halcyon-audio/Cargo.toml --all-targets -- -D warnings
+uv run -- cargo test --manifest-path halcyon-audio/Cargo.toml
 ```
 
 The app entrypoint is:
@@ -72,6 +77,8 @@ Until the repo has a full test harness, run the narrowest available `uv run ...`
 - Avoid hard-coded absolute paths; the original `/home/pi/...` path is legacy.
 - Keep MIDI hardware optional in tests; use mocks or synthetic events.
 - Prefer the real Bluetooth MIDI path at runtime. The primary controller is an Akai Professional LPK25 Wireless.
+- Rust audio receives normalized events from Python over newline-delimited JSON stdin; do not duplicate MIDI device ownership in Rust until a later spec says so.
+- Keep audio callback code realtime-safe: no blocking calls, logging, heap allocation, or locks in the CPAL callback.
 - Textual CSS is not web CSS. Verify with the Textual app, not browser assumptions.
 - Do not commit secrets, generated logs, local plans, or downloaded third-party skill copies.
 - Do not commit local editor settings such as `.vscode/`.
