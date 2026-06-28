@@ -30,6 +30,7 @@ The app will:
 - Start a localhost MCP-compatible control server bound to `127.0.0.1`.
 - Start the Rust sidecar with `uv run -- cargo run --manifest-path halcyon-audio/Cargo.toml --bin halcyon-audio-sidecar`.
 - Send `note_on`, `note_off`, `all_notes_off`, `set_param`, and `shutdown` commands as newline-delimited JSON.
+- Open a local Unix socket visualization channel for raw oscillator sample windows.
 - Produce a small virtual-analog synth voice: saw/square blend oscillator, ADSR envelope, low-pass filter, velocity gain, soft clipping, and 8-voice polyphony.
 
 Inside the app:
@@ -80,6 +81,25 @@ Available tools:
 - `apply_synth_preset`
 - `save_synth_preset`
 - `all_notes_off`
+
+## Audio Visualization Channel
+
+The synth control protocol remains newline-delimited JSON over the Rust sidecar stdin/stdout.
+Waveform visualization uses a separate local Unix domain socket so sample traffic never touches
+the control stream.
+
+Config:
+
+```bash
+export HALCYON_VIZ_SOCKET=/tmp/synth_viz.sock
+export HALCYON_VIZ_SAMPLES=1024
+export HALCYON_VIZ_FPS=60
+```
+
+Python listens on `HALCYON_VIZ_SOCKET`; Rust connects and sends best-effort raw frames. Each frame
+starts with `HZV1` plus a little-endian `u32` sample count, followed by that many little-endian
+`f32` samples. The Textual waveform renderer is intentionally deferred; the Python reader exposes
+the latest sample window for a future widget.
 
 ## Validate
 

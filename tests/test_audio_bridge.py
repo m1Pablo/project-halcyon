@@ -3,6 +3,7 @@ from io import StringIO
 from typing import Any
 
 from halcyon.audio_bridge import RustAudioBridge, default_sidecar_command
+from halcyon.audio_viz import AudioVisualizationSnapshot
 from halcyon.midi import MidiEvent, audio_command_for_event
 
 
@@ -43,6 +44,30 @@ class FakeProcess:
 
     def kill(self) -> None:
         self.returncode = -9
+
+
+class FakeVisualization:
+    socket_path = "/tmp/fake-halcyon-viz.sock"
+    sample_count = 128
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.closed = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def snapshot(self) -> AudioVisualizationSnapshot:
+        return AudioVisualizationSnapshot(
+            socket_path=self.socket_path,
+            sample_count=self.sample_count,
+            connected=False,
+            frame_count=0,
+            samples=(),
+        )
 
 
 def make_event(event_type: str, velocity: int = 96) -> MidiEvent:
@@ -90,7 +115,11 @@ def test_bridge_serializes_midi_events_to_sidecar_protocol() -> None:
         created.append(process)
         return process
 
-    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    bridge = RustAudioBridge(
+        command=["sidecar"],
+        process_factory=process_factory,
+        visualization=FakeVisualization(),  # type: ignore[arg-type]
+    )
     assert bridge.start()
 
     assert bridge.handle_midi_event(make_event("press"))
@@ -111,7 +140,11 @@ def test_bridge_sends_all_notes_off_before_shutdown() -> None:
         created.append(process)
         return process
 
-    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    bridge = RustAudioBridge(
+        command=["sidecar"],
+        process_factory=process_factory,
+        visualization=FakeVisualization(),  # type: ignore[arg-type]
+    )
     bridge.start()
     bridge.close()
 
@@ -128,7 +161,11 @@ def test_bridge_applies_and_replays_patch_on_restart() -> None:
         created.append(process)
         return process
 
-    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    bridge = RustAudioBridge(
+        command=["sidecar"],
+        process_factory=process_factory,
+        visualization=FakeVisualization(),  # type: ignore[arg-type]
+    )
     bridge.apply_patch({"cutoff_hz": 2400.0, "drive": 2.0})
 
     bridge.start()
@@ -145,3 +182,28 @@ def test_bridge_applies_and_replays_patch_on_restart() -> None:
         {"type": "set_param", "name": "cutoff_hz", "value": 2400.0},
         {"type": "set_param", "name": "drive", "value": 2.0},
     ]
+
+
+def test_bridge_starts_visualization_and_passes_socket_env() -> None:
+    created: list[FakeProcess] = []
+    captured_env: list[dict[str, str]] = []
+    visualization = FakeVisualization()
+
+    def process_factory(command: list[str], **kwargs: Any) -> FakeProcess:
+        process = FakeProcess()
+        created.append(process)
+        captured_env.append(kwargs["env"])
+        return process
+
+    bridge = RustAudioBridge(
+        command=["sidecar"],
+        process_factory=process_factory,
+        visualization=visualization,  # type: ignore[arg-type]
+    )
+
+    assert bridge.start()
+
+    assert visualization.started == 1
+    assert captured_env[0]["HALCYON_VIZ_SOCKET"] == "/tmp/fake-halcyon-viz.sock"
+    assert captured_env[0]["HALCYON_VIZ_SAMPLES"] == "128"
+    assert bridge.visualization_snapshot().sample_count == 128

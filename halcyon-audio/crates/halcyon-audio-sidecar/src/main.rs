@@ -10,6 +10,8 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+mod viz;
+
 const COMMAND_QUEUE_SIZE: usize = 1024;
 
 fn main() {
@@ -30,6 +32,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let (producer, consumer) = RingBuffer::<SynthCommand>::new(COMMAND_QUEUE_SIZE);
     let running = Arc::new(AtomicBool::new(true));
     let stdin_handle = spawn_stdin_thread(producer, Arc::clone(&running));
+    let (viz_producer, viz_handle) =
+        viz::spawn_viz_thread(viz::VizConfig::from_env(), Arc::clone(&running));
 
     let host = cpal::default_host();
     let device = host
@@ -47,6 +51,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             sample_rate,
             channels,
             consumer,
+            viz_producer,
             Arc::clone(&running),
         )?,
         cpal::SampleFormat::I16 => build_stream::<i16>(
@@ -55,6 +60,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             sample_rate,
             channels,
             consumer,
+            viz_producer,
             Arc::clone(&running),
         )?,
         cpal::SampleFormat::U16 => build_stream::<u16>(
@@ -63,6 +69,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             sample_rate,
             channels,
             consumer,
+            viz_producer,
             Arc::clone(&running),
         )?,
         sample_format => return Err(format!("unsupported sample format: {sample_format:?}").into()),
@@ -85,6 +92,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     drop(stream);
     let _ = stdin_handle.join();
+    let _ = viz_handle.join();
     Ok(())
 }
 
@@ -140,6 +148,7 @@ fn build_stream<T>(
     sample_rate: f32,
     channels: u16,
     mut consumer: Consumer<SynthCommand>,
+    mut viz_producer: Producer<f32>,
     running: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -164,6 +173,7 @@ where
                 output,
                 channel_count,
                 &mut engine,
+                &mut viz_producer,
                 audio_running.load(Ordering::SeqCst),
             );
         },
@@ -175,12 +185,18 @@ where
     )
 }
 
-fn write_output<T>(output: &mut [T], channels: usize, engine: &mut SynthEngine, running: bool)
-where
+fn write_output<T>(
+    output: &mut [T],
+    channels: usize,
+    engine: &mut SynthEngine,
+    viz_producer: &mut Producer<f32>,
+    running: bool,
+) where
     T: cpal::Sample + cpal::FromSample<f32>,
 {
     for frame in output.chunks_mut(channels) {
         let sample = if running { engine.render_sample() } else { 0.0 };
+        let _ = viz_producer.push(sample);
         let converted = T::from_sample(sample);
         for channel in frame {
             *channel = converted;
