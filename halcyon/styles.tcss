@@ -73,6 +73,7 @@ Footer {
 
 #keyboard-scroll {
     width: 100%;
+    max-width: 212;
     height: 13;
     border: solid #3a4450;
     background: #171b21;

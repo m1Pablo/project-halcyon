@@ -1,4 +1,4 @@
-"""LPK25 keyboard geometry and rendering helpers."""
+"""MIDI keyboard geometry and rendering helpers."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ LPK25_START_NOTE = 48
 LPK25_KEY_COUNT = 25
 WHITE_KEY_WIDTH = 7
 BLACK_KEY_WIDTH = 5
+VISIBLE_WHITE_KEY_COUNT = 30
+VISIBLE_KEYBOARD_WIDTH = VISIBLE_WHITE_KEY_COUNT * WHITE_KEY_WIDTH + 2
 BLACK_NOTE_CLASSES = frozenset({1, 3, 6, 8, 10})
 WHITE_NOTE_CLASSES = frozenset({0, 2, 4, 5, 7, 9, 11})
 KEYBOARD_HEIGHT = 11
@@ -115,10 +117,49 @@ def keyboard_inner_width(keys: tuple[KeyboardKey, ...] | None = None) -> int:
 def key_left(note: int, keys: tuple[KeyboardKey, ...] | None = None) -> int | None:
     """Return the framed horizontal offset for a MIDI note, if rendered."""
 
+    bounds = key_bounds(note, keys)
+    if bounds is None:
+        return None
+    return bounds[0]
+
+
+def key_bounds(note: int, keys: tuple[KeyboardKey, ...] | None = None) -> tuple[int, int] | None:
+    """Return the framed left and right offsets for a MIDI note, if rendered."""
+
     key_set = keys if keys is not None else keyboard_keys()
     for key in key_set:
         if key.note == note:
-            return key.left + 1
+            left = key.left + 1
+            return left, left + key.width
+    return None
+
+
+def scroll_target_for_note(
+    note: int,
+    *,
+    current_scroll: int,
+    viewport_width: int,
+    keys: tuple[KeyboardKey, ...] | None = None,
+) -> int | None:
+    """Return a scroll target only when a note is outside the visible viewport."""
+
+    bounds = key_bounds(note, keys)
+    if bounds is None or viewport_width <= 0:
+        return None
+
+    surface_width = keyboard_width(keys)
+    visible_width = min(viewport_width, surface_width)
+    max_scroll = max(0, surface_width - visible_width)
+    scroll_left = min(max(current_scroll, 0), max_scroll)
+    key_left_offset, key_right_offset = bounds
+    scroll_right = scroll_left + visible_width
+
+    if key_left_offset < scroll_left:
+        return max(0, key_left_offset)
+    if key_right_offset > scroll_right:
+        return min(max_scroll, key_right_offset - visible_width)
+    if scroll_left != current_scroll:
+        return scroll_left
     return None
 
 

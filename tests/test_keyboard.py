@@ -6,7 +6,10 @@ from halcyon.keyboard import (
     MIDI_START_NOTE,
     LPK25_KEY_COUNT,
     LPK25_START_NOTE,
+    VISIBLE_KEYBOARD_WIDTH,
+    VISIBLE_WHITE_KEY_COUNT,
     WHITE_KEY_WIDTH,
+    key_bounds,
     key_left,
     key_style,
     keyboard_keys,
@@ -15,6 +18,7 @@ from halcyon.keyboard import (
     keyboard_text,
     keyboard_width,
     lpk25_keys,
+    scroll_target_for_note,
 )
 
 
@@ -48,6 +52,7 @@ def test_keyboard_geometry_is_fixed_width_and_ordered() -> None:
     assert [key.note for key in keys] == list(range(128))
     assert keyboard_inner_width(keys) == 75 * WHITE_KEY_WIDTH
     assert keyboard_width(keys) == 75 * WHITE_KEY_WIDTH + 2
+    assert VISIBLE_KEYBOARD_WIDTH == VISIBLE_WHITE_KEY_COUNT * WHITE_KEY_WIDTH + 2
 
 
 def test_keyboard_render_is_one_horizontal_piano_surface() -> None:
@@ -71,6 +76,65 @@ def test_key_left_covers_octave_shifted_extremes() -> None:
     assert key_left(120) is not None
     assert key_left(127) is not None
     assert key_left(128) is None
+
+
+def test_sticky_scroll_ignores_adjacent_notes_inside_viewport() -> None:
+    assert (
+        scroll_target_for_note(
+            47,
+            current_scroll=0,
+            viewport_width=VISIBLE_KEYBOARD_WIDTH,
+        )
+        is None
+    )
+    assert (
+        scroll_target_for_note(
+            48,
+            current_scroll=0,
+            viewport_width=VISIBLE_KEYBOARD_WIDTH,
+        )
+        is None
+    )
+    assert (
+        scroll_target_for_note(
+            50,
+            current_scroll=0,
+            viewport_width=VISIBLE_KEYBOARD_WIDTH,
+        )
+        is None
+    )
+
+
+def test_sticky_scroll_moves_only_when_note_leaves_viewport() -> None:
+    note = 52
+    bounds = key_bounds(note)
+    assert bounds is not None
+    _, right = bounds
+
+    assert (
+        scroll_target_for_note(
+            note,
+            current_scroll=0,
+            viewport_width=VISIBLE_KEYBOARD_WIDTH,
+        )
+        == right - VISIBLE_KEYBOARD_WIDTH
+    )
+
+
+def test_sticky_scroll_can_reach_top_midi_note() -> None:
+    bounds = key_bounds(127)
+    assert bounds is not None
+    left, right = bounds
+    target = scroll_target_for_note(
+        127,
+        current_scroll=0,
+        viewport_width=VISIBLE_KEYBOARD_WIDTH,
+    )
+
+    assert target is not None
+    assert target <= left
+    assert right <= target + VISIBLE_KEYBOARD_WIDTH
+    assert target <= keyboard_width() - VISIBLE_KEYBOARD_WIDTH
 
 
 def test_target_key_style_is_distinct() -> None:
