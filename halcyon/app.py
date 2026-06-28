@@ -15,7 +15,7 @@ from halcyon.midi import MidiEvent, MidiInput, MidiUnavailable
 
 
 class VirtualKeyboard(Static):
-    """A compact 25-key keyboard for the LPK25 range."""
+    """A continuous 25-key keyboard surface for the LPK25 range."""
 
     def update_keys(
         self,
@@ -53,12 +53,16 @@ class HalcyonApp(App[None]):
             with Horizontal(id="workspace"):
                 with Vertical(id="monitor-panel"):
                     yield self.status
-                    yield Static("Virtual keyboard", id="keyboard-title", classes="section-title")
-                    with HorizontalScroll(id="keyboard-scroll"):
-                        yield self.keyboard
                 with Vertical(id="log-panel"):
                     yield Static("MIDI event log", id="log-title", classes="section-title")
                     yield self.event_table
+            yield Static(
+                "Akai LPK25 Wireless",
+                id="keyboard-title",
+                classes="section-title",
+            )
+            with HorizontalScroll(id="keyboard-scroll"):
+                yield self.keyboard
         yield Footer()
 
     def on_mount(self) -> None:

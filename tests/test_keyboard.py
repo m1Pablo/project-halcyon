@@ -1,9 +1,11 @@
 from halcyon.keyboard import (
     BLACK_TARGET_STYLE,
+    KEYBOARD_HEIGHT,
     LPK25_KEY_COUNT,
     LPK25_START_NOTE,
     WHITE_KEY_WIDTH,
     key_style,
+    keyboard_inner_width,
     keyboard_notes,
     keyboard_text,
     keyboard_width,
@@ -32,16 +34,22 @@ def test_lpk25_geometry_is_fixed_width_and_ordered() -> None:
 
     assert len(keys) == 25
     assert [key.note for key in keys] == list(range(48, 73))
-    assert keyboard_width(keys) == 15 * WHITE_KEY_WIDTH
+    assert keyboard_inner_width(keys) == 15 * WHITE_KEY_WIDTH
+    assert keyboard_width(keys) == 15 * WHITE_KEY_WIDTH + 2
 
 
-def test_keyboard_render_does_not_wrap() -> None:
+def test_keyboard_render_is_one_horizontal_piano_surface() -> None:
     rendered = keyboard_text({60}, {61})
     lines = rendered.plain.splitlines()
 
-    assert len(lines) == 3
+    assert len(lines) == KEYBOARD_HEIGHT
     assert all(len(line) == keyboard_width() for line in lines)
+    assert lines[0].startswith("┌")
+    assert lines[0].endswith("┐")
+    assert lines[-1].startswith("└")
+    assert lines[-1].endswith("┘")
     assert "C3" in rendered.plain
+    assert "C#3" in rendered.plain
     assert "C5" in rendered.plain
 
 
