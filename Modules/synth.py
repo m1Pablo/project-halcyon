@@ -170,6 +170,7 @@ def main(*args):
 			screen.action=None
 			cls(screen)
 		elif screen.action in ["Open Midi-Out"]:
+			pass
 			
 		elif screen.action in [None]:
 			pass

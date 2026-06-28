@@ -1,0 +1,77 @@
+# AGENTS.md
+
+This file defines how agentic work is done in this repository.
+
+Project Halcyon is a Python MIDI controller/synth/drum experiment moving from a small hand-coded Rich CLI toward a Textual TUI. Preserve the original intent while modernizing deliberately.
+
+## Project Structure
+
+- `halcyon.py` - original top-level menu app.
+- `Modules/menu.py` - original Rich/input menu helper.
+- `Modules/midi.py` - MIDI port listing and polling helpers.
+- `Modules/synth.py` - original synth flow, currently incomplete.
+- `halcyon/` - new package location for the next Textual iteration.
+- `.codex/agents/` - Codex-native workflow roles.
+- `.codex/commands/` - reusable local command notes.
+- `.codex/skills/` - local workflow skills and synced Context Engineering skills.
+- `.codex/plans/`, `.codex/ledger/`, `.codex/logs/` - local coordination memory; never commit generated contents.
+
+## Workflow Contract
+
+Work is spec-driven:
+
+1. The Architect writes a plan/spec note in `.codex/plans/` and updates `.codex/plans/ACTIVE_PLAN.md`.
+2. The Coordinator routes implementation waves from the active plan and records progress in `.codex/ledger/LEDGER.md`.
+3. Implementers change code only within their owned files and log `CLAIM`, `BLOCKER`, and `DONE` evidence.
+4. The Envoy ships completed work when the user asks for git operations.
+
+There is no Sentinel gate in this repo. Security/release risk is handled by ordinary validation, code review, and explicit human approval.
+
+## Git Workflow
+
+- The default branch is `main`. If a clone still has `master`, rename it to `main` before shipping new work.
+- Implementation happens on feature branches. Use `codex/{short-description}` for Codex-led work unless the user gives a specific branch name.
+- Keep `main` clean and push feature branches to GitHub for review.
+- Envoy stages explicit owned files only. Never use `git add .` or `git add -A`.
+- Do not commit `.codex/plans/`, `.codex/ledger/`, `.codex/logs/`, `.env`, `.env.*`, synced third-party skill copies, editor settings, secrets, or generated caches.
+- Draft PRs are the default shipping surface unless the user explicitly asks for a direct push-only flow or ready-for-review PR.
+
+## Product Direction
+
+Near-term target:
+
+- Get the app running in its current spirit.
+- Prefer Textual for the primary UX; use Rich only inside Textual widgets when useful.
+- Log MIDI input events clearly: event type, note, velocity, channel/status, delta time, and source port.
+- Show a virtual keyboard with pressed/released key state.
+- Sound output is not required for the first Textual iteration.
+
+## Validation Policy
+
+All development commands run through `uv`. Do not use bare `python`, `pip`, `pytest`, `ruff`, or app entrypoints when a `uv run ...` equivalent exists.
+
+Run checks appropriate to the change scope before reporting completion:
+
+```bash
+uv run ruff format
+uv run ruff check
+uv run pytest
+```
+
+The app entrypoint is:
+
+```bash
+uv run -m halcyon
+```
+
+Until the repo has a full test harness, run the narrowest available `uv run ...` syntax/import checks and state any missing validation plainly.
+
+## Engineering Notes
+
+- Do not silently rewrite the original code. Migrate behavior into new modules with small, reviewable steps.
+- Avoid hard-coded absolute paths; the original `/home/pi/...` path is legacy.
+- Keep MIDI hardware optional in tests; use mocks or synthetic events.
+- Prefer the real Bluetooth MIDI path at runtime. The primary controller is an Akai Professional LPK25 Wireless.
+- Textual CSS is not web CSS. Verify with the Textual app, not browser assumptions.
+- Do not commit secrets, generated logs, local plans, or downloaded third-party skill copies.
+- Do not commit local editor settings such as `.vscode/`.
