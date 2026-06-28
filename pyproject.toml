@@ -5,6 +5,7 @@ description = "Textual MIDI controller, synth, and drum experiment."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "openai>=2.44.0",
     "python-rtmidi>=1.5.8",
     "textual>=6.0.0",
 ]

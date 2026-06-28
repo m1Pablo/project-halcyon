@@ -44,6 +44,7 @@ class RustAudioBridge:
         self._ready = False
         self._last_status = "Audio: stopped"
         self._last_error: str | None = None
+        self._current_patch: dict[str, float] = {}
 
     @property
     def process(self) -> Any | None:
@@ -75,6 +76,7 @@ class RustAudioBridge:
 
         self._start_reader(self._process.stdout, "stdout")
         self._start_reader(self._process.stderr, "stderr")
+        self._replay_patch()
         return True
 
     @property
@@ -122,7 +124,16 @@ class RustAudioBridge:
         return self.send({"type": "all_notes_off"})
 
     def set_param(self, name: str, value: float) -> bool:
-        return self.send({"type": "set_param", "name": name, "value": float(value)})
+        value = float(value)
+        with self._lock:
+            self._current_patch[name] = value
+        return self.send({"type": "set_param", "name": name, "value": value})
+
+    def apply_patch(self, values: dict[str, float]) -> bool:
+        success = True
+        for name, value in values.items():
+            success = self.set_param(name, value) and success
+        return success
 
     def shutdown(self) -> bool:
         return self.send({"type": "shutdown"})
@@ -225,6 +236,12 @@ class RustAudioBridge:
                 self._ready = False
                 self._last_status = "Audio: sidecar error"
                 self._last_error = str(payload.get("message", "unknown error"))
+
+    def _replay_patch(self) -> None:
+        with self._lock:
+            patch = dict(self._current_patch)
+        for name, value in patch.items():
+            self.send({"type": "set_param", "name": name, "value": value})
 
 
 def default_sidecar_command() -> list[str]:

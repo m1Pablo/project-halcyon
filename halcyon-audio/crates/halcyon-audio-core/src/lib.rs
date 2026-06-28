@@ -38,6 +38,7 @@ pub struct SynthParams {
     pub decay_seconds: f32,
     pub sustain_level: f32,
     pub release_seconds: f32,
+    pub drive: f32,
 }
 
 impl Default for SynthParams {
@@ -50,6 +51,7 @@ impl Default for SynthParams {
             decay_seconds: 0.12,
             sustain_level: 0.72,
             release_seconds: 0.25,
+            drive: 1.0,
         }
     }
 }
@@ -64,6 +66,7 @@ impl SynthParams {
             "decay_seconds" => self.decay_seconds = value.clamp(0.0, 5.0),
             "sustain_level" => self.sustain_level = value.clamp(0.0, 1.0),
             "release_seconds" => self.release_seconds = value.clamp(0.0, 8.0),
+            "drive" => self.drive = value.clamp(1.0, 8.0),
             _ => return false,
         }
         true
@@ -282,7 +285,7 @@ impl SynthEngine {
         }
         self.voices.retain(|voice| !voice.is_done());
 
-        soft_clip(sample * self.params.master_gain)
+        soft_clip(sample * self.params.master_gain * self.params.drive)
     }
 
     pub fn render_block(&mut self, output: &mut [f32]) {
@@ -418,5 +421,26 @@ mod tests {
         }
 
         assert_eq!(engine.active_voice_count(), 3);
+    }
+
+    #[test]
+    fn drive_param_clamps_and_keeps_output_bounded() {
+        let mut engine = SynthEngine::new(48_000.0);
+        engine.handle_command(SynthCommand::SetParam {
+            name: "drive".to_owned(),
+            value: 99.0,
+        });
+        assert_eq!(engine.params().drive, 8.0);
+
+        engine.handle_command(SynthCommand::NoteOn {
+            note: 64,
+            velocity: 127,
+            channel: 1,
+        });
+        let samples = engine.render_offline(0.1);
+
+        assert!(max_abs(&samples) > 0.001);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+        assert!(samples.iter().all(|sample| sample.abs() <= 1.0));
     }
 }
