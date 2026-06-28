@@ -1,0 +1,96 @@
+Screen {
+    background: #111317;
+    color: #eceff4;
+}
+
+Header {
+    background: #1d252c;
+    color: #eceff4;
+}
+
+Footer {
+    background: #1d252c;
+    color: #a7b1bc;
+}
+
+#app-shell {
+    height: 1fr;
+    padding: 1 2 0 2;
+}
+
+#title {
+    height: 2;
+    content-align: left middle;
+    text-style: bold;
+    color: #f0b429;
+}
+
+#workspace {
+    height: 1fr;
+    min-height: 7;
+    width: 100%;
+    layout: horizontal;
+}
+
+#monitor-panel {
+    width: 38%;
+    min-width: 34;
+    padding-right: 1;
+    height: 100%;
+}
+
+#log-panel {
+    width: 1fr;
+    min-width: 40;
+    height: 100%;
+    padding-left: 1;
+}
+
+#status {
+    height: 6;
+    padding: 1;
+    border: solid #3a4450;
+    background: #171b21;
+}
+
+.section-title {
+    height: 1;
+    margin-top: 1;
+    margin-bottom: 0;
+    color: #95d5b2;
+    text-style: bold;
+    content-align: left middle;
+}
+
+#log-title {
+    margin-left: 0;
+    padding-left: 1;
+}
+
+#keyboard-title {
+    padding-left: 0;
+}
+
+#keyboard-scroll {
+    width: 100%;
+    max-width: 212;
+    height: 13;
+    border: solid #3a4450;
+    background: #171b21;
+    overflow-x: auto;
+    overflow-y: hidden;
+}
+
+#keyboard {
+    width: 527;
+    height: 11;
+    padding: 0;
+    background: #171b21;
+}
+
+#event-log {
+    height: 1fr;
+    margin-top: 0;
+    border: solid #3a4450;
+    background: #171b21;
+}
