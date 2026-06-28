@@ -8,6 +8,9 @@ from rich.text import Text
 
 from halcyon.midi import note_name
 
+MIDI_START_NOTE = 0
+MIDI_END_NOTE = 127
+MIDI_KEY_COUNT = MIDI_END_NOTE - MIDI_START_NOTE + 1
 LPK25_START_NOTE = 48
 LPK25_KEY_COUNT = 25
 WHITE_KEY_WIDTH = 7
@@ -29,7 +32,7 @@ COMBINED_STATE_STYLE = "bold black on #f97316"
 
 @dataclass(frozen=True)
 class KeyboardKey:
-    """A single physical key in the LPK25 visual model."""
+    """A single key in the full MIDI visual model."""
 
     note: int
     name: str
@@ -45,17 +48,17 @@ def is_black_note(note: int) -> bool:
 
 
 def keyboard_notes(
-    start_note: int = LPK25_START_NOTE, key_count: int = LPK25_KEY_COUNT
+    start_note: int = MIDI_START_NOTE, key_count: int = MIDI_KEY_COUNT
 ) -> tuple[int, ...]:
-    """Return the fixed 25-note LPK25 range."""
+    """Return the full MIDI note range by default."""
 
     return tuple(range(start_note, start_note + key_count))
 
 
-def lpk25_keys(
-    start_note: int = LPK25_START_NOTE, key_count: int = LPK25_KEY_COUNT
+def keyboard_keys(
+    start_note: int = MIDI_START_NOTE, key_count: int = MIDI_KEY_COUNT
 ) -> tuple[KeyboardKey, ...]:
-    """Return physical key positions for the fixed-width LPK25 replica."""
+    """Return key positions for a fixed-width piano surface."""
 
     keys: list[KeyboardKey] = []
     white_count = 0
@@ -87,6 +90,14 @@ def lpk25_keys(
     return tuple(keys)
 
 
+def lpk25_keys(
+    start_note: int = LPK25_START_NOTE, key_count: int = LPK25_KEY_COUNT
+) -> tuple[KeyboardKey, ...]:
+    """Return physical key positions for one unshifted 25-key LPK25 span."""
+
+    return keyboard_keys(start_note, key_count)
+
+
 def keyboard_width(keys: tuple[KeyboardKey, ...] | None = None) -> int:
     """Return the fixed render width for a framed key set."""
 
@@ -96,9 +107,19 @@ def keyboard_width(keys: tuple[KeyboardKey, ...] | None = None) -> int:
 def keyboard_inner_width(keys: tuple[KeyboardKey, ...] | None = None) -> int:
     """Return the fixed inner piano-bed width for a key set."""
 
-    key_set = keys if keys is not None else lpk25_keys()
+    key_set = keys if keys is not None else keyboard_keys()
     white_keys = sum(1 for key in key_set if not key.is_black)
     return white_keys * WHITE_KEY_WIDTH
+
+
+def key_left(note: int, keys: tuple[KeyboardKey, ...] | None = None) -> int | None:
+    """Return the framed horizontal offset for a MIDI note, if rendered."""
+
+    key_set = keys if keys is not None else keyboard_keys()
+    for key in key_set:
+        if key.note == note:
+            return key.left + 1
+    return None
 
 
 def key_style(
@@ -256,9 +277,9 @@ def keyboard_text(
     *,
     keys: tuple[KeyboardKey, ...] | None = None,
 ) -> Text:
-    """Render a fixed-width LPK25 piano surface as rich text."""
+    """Render a fixed-width MIDI piano surface as rich text."""
 
-    key_set = keys if keys is not None else lpk25_keys()
+    key_set = keys if keys is not None else keyboard_keys()
     width = keyboard_width(key_set)
     grid = _new_grid(width)
     _draw_frame(grid, width=width)

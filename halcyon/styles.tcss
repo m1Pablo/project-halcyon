@@ -81,7 +81,7 @@ Footer {
 }
 
 #keyboard {
-    width: 107;
+    width: 527;
     height: 11;
     padding: 0;
     background: #171b21;

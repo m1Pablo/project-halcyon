@@ -9,7 +9,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical
 from textual.widgets import DataTable, Footer, Header, Static
 
-from halcyon.keyboard import keyboard_text
+from halcyon.keyboard import key_left, keyboard_text
 from halcyon.logs import MidiEventLog
 from halcyon.midi import MidiEvent, MidiInput, MidiUnavailable
 
@@ -44,6 +44,7 @@ class HalcyonApp(App[None]):
         self.event_count = 0
         self.status = Static("Starting MIDI monitor...", id="status")
         self.keyboard = VirtualKeyboard(id="keyboard")
+        self.keyboard_scroll = HorizontalScroll(id="keyboard-scroll")
         self.event_table = DataTable(id="event-log", zebra_stripes=True)
 
     def compose(self) -> ComposeResult:
@@ -61,7 +62,7 @@ class HalcyonApp(App[None]):
                 id="keyboard-title",
                 classes="section-title",
             )
-            with HorizontalScroll(id="keyboard-scroll"):
+            with self.keyboard_scroll:
                 yield self.keyboard
         yield Footer()
 
@@ -122,6 +123,7 @@ class HalcyonApp(App[None]):
             self.pressed_notes.discard(event.note)
 
         self.keyboard.update_keys(self.pressed_notes, self.target_notes)
+        self._scroll_keyboard_to(event.note)
         self.event_log.append(event)
         self.event_count += 1
         self.event_table.add_row(
@@ -139,6 +141,15 @@ class HalcyonApp(App[None]):
             first_key = next(iter(self.event_table.rows.keys()))
             self.event_table.remove_row(first_key)
         self.event_table.move_cursor(row=len(self.event_table.rows) - 1)
+
+    def _scroll_keyboard_to(self, note: int) -> None:
+        left = key_left(note)
+        if left is None:
+            return
+
+        viewport_width = self.keyboard_scroll.size.width
+        scroll_x = max(0, left - max(8, viewport_width // 2))
+        self.keyboard_scroll.scroll_to(x=scroll_x, animate=False, immediate=True)
 
 
 def main() -> None:
