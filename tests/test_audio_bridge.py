@@ -1,0 +1,120 @@
+import json
+from io import StringIO
+from typing import Any
+
+from halcyon.audio_bridge import RustAudioBridge, default_sidecar_command
+from halcyon.midi import MidiEvent, audio_command_for_event
+
+
+class FakeStdin:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.closed = False
+
+    def write(self, value: str) -> int:
+        self.lines.append(value)
+        return len(value)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProcess:
+    def __init__(self) -> None:
+        self.stdin = FakeStdin()
+        self.stdout = StringIO()
+        self.stderr = StringIO()
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.returncode = 0
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+def make_event(event_type: str, velocity: int = 96) -> MidiEvent:
+    return MidiEvent(
+        event_type=event_type,
+        note=60,
+        note_name="C4",
+        velocity=velocity,
+        channel=1,
+        status=0x90,
+        raw_message=(0x90, 60, velocity),
+        delta_time=0.01,
+        source="LPK25",
+        elapsed=1.0,
+    )
+
+
+def test_default_sidecar_command_runs_cargo_through_uv() -> None:
+    command = default_sidecar_command()
+
+    assert command[:4] == ["uv", "run", "--", "cargo"]
+    assert "--manifest-path" in command
+    assert "halcyon-audio-sidecar" in command
+
+
+def test_audio_command_for_event_maps_press_and_release() -> None:
+    assert audio_command_for_event(make_event("press")) == {
+        "type": "note_on",
+        "note": 60,
+        "velocity": 96,
+        "channel": 1,
+    }
+    assert audio_command_for_event(make_event("release", velocity=0)) == {
+        "type": "note_off",
+        "note": 60,
+        "channel": 1,
+    }
+
+
+def test_bridge_serializes_midi_events_to_sidecar_protocol() -> None:
+    created: list[FakeProcess] = []
+
+    def process_factory(command: list[str], **kwargs: Any) -> FakeProcess:
+        process = FakeProcess()
+        created.append(process)
+        return process
+
+    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    assert bridge.start()
+
+    assert bridge.handle_midi_event(make_event("press"))
+    assert bridge.handle_midi_event(make_event("release", velocity=0))
+
+    writes = [json.loads(line) for line in created[0].stdin.lines]
+    assert writes == [
+        {"type": "note_on", "note": 60, "velocity": 96, "channel": 1},
+        {"type": "note_off", "note": 60, "channel": 1},
+    ]
+
+
+def test_bridge_sends_all_notes_off_before_shutdown() -> None:
+    created: list[FakeProcess] = []
+
+    def process_factory(command: list[str], **kwargs: Any) -> FakeProcess:
+        process = FakeProcess()
+        created.append(process)
+        return process
+
+    bridge = RustAudioBridge(command=["sidecar"], process_factory=process_factory)
+    bridge.start()
+    bridge.close()
+
+    writes = [json.loads(line) for line in created[0].stdin.lines]
+    assert writes == [{"type": "all_notes_off"}, {"type": "shutdown"}]
+    assert created[0].stdin.closed

@@ -91,6 +91,25 @@ def normalize_message(
     )
 
 
+def audio_command_for_event(event: MidiEvent) -> dict[str, int | str] | None:
+    """Translate a normalized MIDI event into the Rust sidecar IPC schema."""
+
+    if event.is_press:
+        return {
+            "type": "note_on",
+            "note": event.note,
+            "velocity": event.velocity,
+            "channel": event.channel,
+        }
+    if event.is_release:
+        return {
+            "type": "note_off",
+            "note": event.note,
+            "channel": event.channel,
+        }
+    return None
+
+
 def choose_preferred_port(
     ports: list[str], preferred_terms: tuple[str, ...] = PREFERRED_PORT_TERMS
 ) -> int | None:
