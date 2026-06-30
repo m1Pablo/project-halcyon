@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
+from halcyon.audio_viz import AudioVisualizationReader, AudioVisualizationSnapshot
 from halcyon.midi import MidiEvent, audio_command_for_event
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,9 +36,11 @@ class RustAudioBridge:
         command: Sequence[str] | None = None,
         *,
         process_factory: Callable[..., Any] | None = None,
+        visualization: AudioVisualizationReader | None = None,
     ) -> None:
         self.command = list(command) if command is not None else default_sidecar_command()
         self._process_factory = process_factory or subprocess.Popen
+        self.visualization = visualization or AudioVisualizationReader()
         self._process: Any | None = None
         self._lock = threading.Lock()
         self._reader_threads: list[threading.Thread] = []
@@ -60,6 +63,7 @@ class RustAudioBridge:
             self._last_error = None
 
         try:
+            self.visualization.start()
             self._process = self._process_factory(
                 self.command,
                 stdin=subprocess.PIPE,
@@ -67,8 +71,10 @@ class RustAudioBridge:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
+                env=self._sidecar_env(),
             )
         except OSError as exc:
+            self.visualization.close()
             with self._lock:
                 self._last_status = "Audio: unavailable"
                 self._last_error = str(exc)
@@ -106,6 +112,9 @@ class RustAudioBridge:
         if error and not ready:
             status = f"{status}\n{error[-180:]}"
         return AudioBridgeSnapshot(running=running, ready=ready, text=status)
+
+    def visualization_snapshot(self) -> AudioVisualizationSnapshot:
+        return self.visualization.snapshot()
 
     def note_on(self, note: int, velocity: int, channel: int) -> bool:
         return self.send(
@@ -164,6 +173,7 @@ class RustAudioBridge:
     def close(self) -> None:
         process = self._process
         if process is None:
+            self.visualization.close()
             return
 
         if process.poll() is None:
@@ -187,6 +197,7 @@ class RustAudioBridge:
         with self._lock:
             self._ready = False
             self._last_status = "Audio: stopped"
+        self.visualization.close()
         self._process = None
 
     def _start_reader(self, stream: TextIO | None, stream_name: str) -> None:
@@ -242,6 +253,12 @@ class RustAudioBridge:
             patch = dict(self._current_patch)
         for name, value in patch.items():
             self.send({"type": "set_param", "name": name, "value": value})
+
+    def _sidecar_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.setdefault("HALCYON_VIZ_SOCKET", self.visualization.socket_path)
+        env.setdefault("HALCYON_VIZ_SAMPLES", str(self.visualization.sample_count))
+        return env
 
 
 def default_sidecar_command() -> list[str]:

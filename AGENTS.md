@@ -82,6 +82,8 @@ Until the repo has a full test harness, run the narrowest available `uv run ...`
 - Prefer the real Bluetooth MIDI path at runtime. The primary controller is an Akai Professional LPK25 Wireless.
 - Rust audio receives normalized events from Python over newline-delimited JSON stdin; do not duplicate MIDI device ownership in Rust until a later spec says so.
 - Rust also receives synth parameter changes from Python over the same stdin protocol; replay the current patch after sidecar restart/reconnect.
+- Rust sends waveform visualization samples over a separate Unix domain socket configured by `HALCYON_VIZ_SOCKET`; do not add sample payloads to the JSON control protocol.
+- Visualization frames are raw `HZV1` + little-endian `u32` count + little-endian `f32` samples. Keep sending best-effort and off the audio thread.
 - Keep audio callback code realtime-safe: no blocking calls, logging, heap allocation, or locks in the CPAL callback.
 - Keep OpenAI usage environment-only. Do not read `.env`, print API keys, or use live OpenAI calls in automated tests.
 - Local MCP control must bind to `127.0.0.1` and expose only synth state/parameter/preset/all-notes-off tools.

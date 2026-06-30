@@ -12,6 +12,7 @@ from textual.widgets import DataTable, Footer, Header, Static
 
 from halcyon.assistant import HalcyonAssistant, local_tool_executor
 from halcyon.audio_bridge import RustAudioBridge
+from halcyon.audio_viz import AudioVisualizationSnapshot
 from halcyon.chat_widgets import ChatPanel
 from halcyon.controls import SynthRack
 from halcyon.keyboard import keyboard_text, scroll_target_for_note
@@ -290,6 +291,11 @@ class HalcyonApp(App[None]):
         self.pressed_notes.clear()
         self.keyboard.update_keys(self.pressed_notes, self.target_notes)
         return self.synth_tool_state()
+
+    def audio_visualization_snapshot(self) -> AudioVisualizationSnapshot:
+        """Return the latest raw waveform sample window for future UI widgets."""
+
+        return self.audio.visualization_snapshot()
 
     def _execute_tool_from_worker(
         self, name: str, arguments: dict[str, object]
