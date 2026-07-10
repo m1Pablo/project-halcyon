@@ -33,6 +33,9 @@ There is no Sentinel gate in this repo. Security/release risk is handled by ordi
 - The default branch is `main`. If a clone still has `master`, rename it to `main` before shipping new work.
 - Implementation happens on feature branches. Use `codex/{short-description}` for Codex-led work unless the user gives a specific branch name.
 - Keep `main` clean and push feature branches to GitHub for review.
+- GitHub CLI and repository operations for this repository must use the `m1Pablo` account. Before any `gh` operation, verify the active account and, when needed, run `gh auth switch --hostname github.com --user m1Pablo`.
+- Use and verify the repository `m1Pablo/project-halcyon`; prefer explicit `--repo m1Pablo/project-halcyon` arguments where supported.
+- If access to `m1Pablo/project-halcyon` fails, stop and surface the blocker. Do not create a replacement repository or change `origin` as an automatic fallback.
 - Envoy stages explicit owned files only. Never use `git add .` or `git add -A`.
 - Do not commit `.codex/plans/`, `.codex/ledger/`, `.codex/logs/`, `.env`, `.env.*`, synced third-party skill copies, editor settings, secrets, or generated caches.
 - Draft PRs are the default shipping surface unless the user explicitly asks for a direct push-only flow or ready-for-review PR.
