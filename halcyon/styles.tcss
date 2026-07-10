@@ -214,6 +214,13 @@ SynthKnob:focus {
     background: #15191e;
 }
 
+#chat-slash-hint {
+    height: 1;
+    padding: 0 1;
+    color: #a7b1bc;
+    background: #15191e;
+}
+
 #chat-input-row {
     height: 3;
     width: 100%;

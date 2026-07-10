@@ -1,0 +1,63 @@
+<menu>
+    <option name="Synth" shortcut="synth" description="Inspect and adjust the current synth patch">
+        <suboption
+            name="State"
+            shortcut="state"
+            tool="get_synth_state"
+            description="Show current synth patch, audio status, pressed notes, and recent MIDI events"
+        />
+        <suboption
+            name="Params"
+            shortcut="params"
+            tool="list_synth_params"
+            description="List safe synth parameters, ranges, units, and built-in presets"
+        />
+        <suboption
+            name="Set"
+            shortcut="set"
+            tool="set_synth_param"
+            usage="/synth set &lt;param&gt; &lt;0..1&gt;"
+            description="Set one synth parameter to a normalized value"
+            mcp_concurrency_group="synth_patch"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Patch"
+            shortcut="patch"
+            tool="apply_synth_patch"
+            usage="/synth patch &lt;param=value ...&gt;"
+            description="Apply multiple normalized synth parameter values"
+            mcp_concurrency_group="synth_patch"
+            mcp_poll_after_s="1"
+        />
+    </option>
+    <option name="Preset" shortcut="preset" description="Apply or save synth presets">
+        <suboption
+            name="Apply"
+            shortcut="apply"
+            tool="apply_synth_preset"
+            usage="/preset apply &lt;name&gt;"
+            description="Apply a named built-in or user synth preset"
+            mcp_concurrency_group="synth_patch"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Save"
+            shortcut="save"
+            tool="save_synth_preset"
+            usage="/preset save &lt;name&gt;"
+            description="Save the current synth patch as a user preset"
+            mcp_concurrency_group="synth_patch"
+            mcp_poll_after_s="1"
+        />
+    </option>
+    <command
+        name="Panic"
+        shortcut="panic"
+        tool="all_notes_off"
+        description="Release all currently sounding notes"
+        mcp_single_flight="false"
+        mcp_parallel_ok="true"
+        mcp_poll_after_s="1"
+    />
+</menu>

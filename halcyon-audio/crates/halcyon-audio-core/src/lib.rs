@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
 pub const DEFAULT_POLYPHONY: usize = 8;
+const OUTPUT_CEILING: f32 = 0.88;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -279,13 +280,15 @@ impl SynthEngine {
         let mut sample = 0.0;
         let params = self.params;
         let sample_rate = self.sample_rate;
+        let voice_count = self.voices.len().max(1) as f32;
 
         for voice in &mut self.voices {
             sample += voice.render(params, sample_rate);
         }
         self.voices.retain(|voice| !voice.is_done());
 
-        soft_clip(sample * self.params.master_gain * self.params.drive)
+        let polyphony_gain = voice_count.sqrt().recip();
+        soft_clip(sample * polyphony_gain * self.params.master_gain * self.params.drive)
     }
 
     pub fn render_block(&mut self, output: &mut [f32]) {
@@ -330,7 +333,7 @@ pub fn midi_note_to_hz(note: u8) -> f32 {
 }
 
 fn soft_clip(sample: f32) -> f32 {
-    sample.tanh().clamp(-1.0, 1.0)
+    (sample.tanh() * OUTPUT_CEILING).clamp(-OUTPUT_CEILING, OUTPUT_CEILING)
 }
 
 #[cfg(test)]
@@ -341,6 +344,14 @@ mod tests {
         samples
             .iter()
             .fold(0.0_f32, |acc, sample| acc.max(sample.abs()))
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        let sum = samples
+            .iter()
+            .map(|sample| sample * sample)
+            .fold(0.0_f32, |acc, value| acc + value);
+        (sum / samples.len().max(1) as f32).sqrt()
     }
 
     #[test]
@@ -442,5 +453,30 @@ mod tests {
         assert!(max_abs(&samples) > 0.001);
         assert!(samples.iter().all(|sample| sample.is_finite()));
         assert!(samples.iter().all(|sample| sample.abs() <= 1.0));
+        assert!(max_abs(&samples) <= OUTPUT_CEILING);
+    }
+
+    #[test]
+    fn chords_keep_reasonable_headphone_level_against_single_notes() {
+        let mut single = SynthEngine::new(48_000.0);
+        single.handle_command(SynthCommand::NoteOn {
+            note: 60,
+            velocity: 120,
+            channel: 1,
+        });
+        let single_samples = single.render_offline(0.2);
+
+        let mut chord = SynthEngine::new(48_000.0);
+        for note in [60, 64, 67, 71] {
+            chord.handle_command(SynthCommand::NoteOn {
+                note,
+                velocity: 120,
+                channel: 1,
+            });
+        }
+        let chord_samples = chord.render_offline(0.2);
+
+        assert!(rms(&single_samples) > 0.001);
+        assert!(rms(&chord_samples) < rms(&single_samples) * 2.2);
     }
 }
