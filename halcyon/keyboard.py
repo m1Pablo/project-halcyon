@@ -21,15 +21,15 @@ BLACK_NOTE_CLASSES = frozenset({1, 3, 6, 8, 10})
 WHITE_NOTE_CLASSES = frozenset({0, 2, 4, 5, 7, 9, 11})
 KEYBOARD_HEIGHT = 11
 
-PANEL_STYLE = "on #171b21"
-FRAME_STYLE = "bold #6f7b86 on #171b21"
-BLACK_IDLE_STYLE = "white on #16181d"
-WHITE_IDLE_STYLE = "black on #f4f1de"
-BLACK_PRESSED_STYLE = "bold black on #f0b429"
-WHITE_PRESSED_STYLE = "bold black on #95d5b2"
-BLACK_TARGET_STYLE = "bold white on #2d6cdf"
-WHITE_TARGET_STYLE = "bold black on #9ad0f5"
-COMBINED_STATE_STYLE = "bold black on #f97316"
+PANEL_STYLE = "on #11151d"
+FRAME_STYLE = "bold #596275 on #11151d"
+BLACK_IDLE_STYLE = "#fcfcfa on #090b10"
+WHITE_IDLE_STYLE = "#090b10 on #fcfcfa"
+BLACK_PRESSED_STYLE = "bold #090b10 on #ff9f43"
+WHITE_PRESSED_STYLE = "bold #090b10 on #ff9f43"
+BLACK_TARGET_STYLE = "bold #090b10 on #78dce8"
+WHITE_TARGET_STYLE = "bold #090b10 on #78dce8"
+COMBINED_STATE_STYLE = "bold #090b10 on #ffd866"
 
 
 @dataclass(frozen=True)

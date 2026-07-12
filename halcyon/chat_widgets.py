@@ -8,7 +8,8 @@ from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Button, Input, RichLog, Static
+from textual.widgets import Button, RichLog, Static, TextArea
+from textual.widgets.text_area import Selection
 
 from halcyon.slash_commands import (
     SlashCompletion,
@@ -17,17 +18,52 @@ from halcyon.slash_commands import (
 )
 
 
-class ChatInput(Input):
-    """Single-line chat input for Halcyon prompts."""
+class ChatInput(TextArea):
+    """Multiline command input with instrument-style submit semantics."""
 
-    def _on_key(self, event: events.Key) -> None:
+    @property
+    def value(self) -> str:
+        """Compatibility alias retained for the previous Input contract."""
+
+        return self.text
+
+    @value.setter
+    def value(self, value: str) -> None:
+        self.load_text(value)
+
+    @property
+    def cursor_position(self) -> int:
+        row, column = self.selection.end
+        lines = self.text.splitlines(keepends=True)
+        return sum(len(line) for line in lines[:row]) + column
+
+    @cursor_position.setter
+    def cursor_position(self, position: int) -> None:
+        prefix = self.text[: max(0, min(position, len(self.text)))]
+        row = prefix.count("\n")
+        column = len(prefix.rsplit("\n", 1)[-1])
+        self.selection = Selection.cursor((row, column))
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "shift+enter":
+            self.insert("\n")
+            event.prevent_default()
+            event.stop()
+            return
         if event.key == "tab":
             panel = self._chat_panel()
             if panel is not None and panel.accept_slash_completion():
                 event.prevent_default()
                 event.stop()
                 return
-        super()._on_key(event)
+        if event.key == "enter":
+            panel = self._chat_panel()
+            if panel is not None:
+                panel.submit_input()
+                event.prevent_default()
+                event.stop()
+                return
+        await super()._on_key(event)
 
     def _chat_panel(self) -> ChatPanel | None:
         widget = self.parent
@@ -63,7 +99,10 @@ class ChatPanel(Vertical):
         self.input = ChatInput(
             id="chat-input",
             placeholder="Ask Halcyon",
-            max_length=800,
+            soft_wrap=True,
+            show_line_numbers=False,
+            tab_behavior="focus",
+            compact=True,
         )
         self.send_button = Button("Send", id="chat-send", variant="primary")
 
@@ -82,21 +121,20 @@ class ChatPanel(Vertical):
             self.write_system("Assistant offline")
         self.call_after_refresh(self.input.focus)
 
-    def on_input_submitted(self, message: Input.Submitted) -> None:
-        if message.input is not self.input:
+    def on_text_area_changed(self, message: TextArea.Changed) -> None:
+        if message.text_area is not self.input:
             return
-        message.stop()
-        self._submit()
-
-    def on_input_changed(self, message: Input.Changed) -> None:
-        if message.input is not self.input:
-            return
-        self._refresh_slash_hint(message.value)
+        self._refresh_slash_hint(self.input.text)
 
     def on_button_pressed(self, message: Button.Pressed) -> None:
         if message.button is not self.send_button:
             return
         message.stop()
+        self._submit()
+
+    def submit_input(self) -> None:
+        """Submit the current prompt; used by Enter and the send button."""
+
         self._submit()
 
     def write_user(self, text: str) -> None:

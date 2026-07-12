@@ -6,7 +6,9 @@ The current iteration is a Textual TUI that listens to real MIDI input, logs not
 
 The first target controller is an Akai Professional LPK25 Wireless connected over Bluetooth MIDI. Python owns MIDI and UI for now; Rust owns realtime audio output.
 
-The newest surface adds a hardware-style synth rack, a compact command chat, and a local MCP-compatible command bridge. The public control ABI is `halcyon/menu.xml`: chat, natural-language routing, and MCP all resolve to registered slash commands. Those slash leaves call the internal safe synth tools, but the LLM and external MCP clients do not get raw shell, file, MIDI-device, or network tools.
+The newest surface is a responsive performance cockpit: the live oscillator and piano own the center stage, MIDI activity remains visible beside them, and the command console stays docked below. Sound design and preset management live in a persistent Textual settings modal rather than competing with the instrument for permanent screen space.
+
+The public control ABI is `halcyon/menu.xml`: chat, natural-language routing, and MCP all resolve to registered slash commands. Those slash leaves call the internal safe synth tools, but the LLM and external MCP clients do not get raw shell, file, MIDI-device, or network tools.
 
 ## Run
 
@@ -22,10 +24,11 @@ The app will:
 - Prefer a port containing `lpk25`, `akai`, or `wireless`.
 - Log note, velocity, channel, status byte, delta time, elapsed time, and source port.
 - Show a full MIDI `0..127` virtual keyboard with a sticky horizontal viewport and highlight pressed keys.
-- Show a horizontal synth rack with `Volume`, `Tone`, `Shape`, `Attack`, `Decay`, `Sustain`, `Release`, and `Drive` controls.
+- Render live audio samples as geometric Unicode Braille animation in `Wave`, `Orbit`, or `Radial` mode.
+- Open a scrollable Sound Settings modal containing `Volume`, `Tone`, `Shape`, `Attack`, `Decay`, `Sustain`, `Release`, and `Drive` controls.
 - Adjust synth controls with visible `-` / `+` buttons or focused arrow keys.
-- Apply `Init`, `Pluck`, `Soft Pad`, `Bass`, and `Lead` presets.
-- Save local user synth presets from the rack or through slash-command chat/MCP.
+- Clearly distinguish the loaded preset from the highlighted candidate; explicitly load `Init`, `Pluck`, `Soft Pad`, `Bass`, `Lead`, or a user preset.
+- Save a named user preset through the modal or slash-command chat/MCP. Built-in presets cannot be overwritten.
 - Show a command chat panel. Direct `/` slash commands work without OpenAI; natural-language routing uses the LLM when `OPENAI_API_KEY` is present.
 - Start a localhost MCP-compatible control server bound to `127.0.0.1`.
 - Start the Rust sidecar with `uv run -- cargo run --manifest-path halcyon-audio/Cargo.toml --bin halcyon-audio-sidecar`.
@@ -37,6 +40,9 @@ Inside the app:
 
 - `r` reconnects MIDI.
 - `c` clears the event log.
+- Click `Wave`, `Orbit`, or `Radial` to change the oscillator projection. Clicking the animated scope itself never changes modes.
+- Press `,`, `Ctrl+S`, or `F2` to open Sound Settings. Press Escape, use Close, or click the dimmed backdrop to dismiss it.
+- On compact terminals, use `F1` for Stage, `F2` for Settings, `F3` for MIDI, and `F4` for Console.
 - Type `/` commands in `Ask Halcyon`; press Tab to accept slash completion and Enter or `Send` to submit.
 - Natural-language messages are routed to validated slash commands from `menu.xml`, or rejected.
 - `Ctrl+Q` quits.
@@ -126,8 +132,54 @@ export HALCYON_VIZ_FPS=60
 
 Python listens on `HALCYON_VIZ_SOCKET`; Rust connects and sends best-effort raw frames. Each frame
 starts with `HZV1` plus a little-endian `u32` sample count, followed by that many little-endian
-`f32` samples. The Textual waveform renderer is intentionally deferred; the Python reader exposes
-the latest sample window for a future widget.
+`f32` samples. `HALCYON_VIZ_SAMPLES` is bounded by the Python reader, and Rust bounds
+`HALCYON_VIZ_FPS` to `1..120`.
+
+The live `OscillatorScope` reads immutable snapshots from that channel at a bounded UI refresh
+rate. It renders three sample-driven projections:
+
+- **Wave**: a time-domain polyline.
+- **Orbit**: the signal plotted against a lagged copy, producing loops and ellipses.
+- **Radial**: amplitude wrapped around a polar path.
+
+The renderer is a clean-room Halcyon implementation of the general Textual line-rendering and
+Unicode Braille technique seen in Toad's Mandelbrot widget: every terminal cell packs a 2×4 logical
+pixel raster into one Braille code point, and `render_line` returns styled Rich strips. Aplazo's
+Textual app and Toad informed the interaction and layout direction; no Toad implementation or
+constants were copied.
+
+Visualization is deliberately non-critical. The Python listener survives peer disconnects,
+returns to its accept loop, and marks the snapshot disconnected; the scope then shows
+`VIZ DISCONNECTED` instead of crashing the MIDI/UI control plane. A connected stream without a
+sample window shows `VIZ IDLE`.
+
+## Responsive Interface
+
+Halcyon chooses wide, medium, or compact behavior from the actual Textual screen dimensions.
+Wide and medium layouts keep the performance stage and MIDI activity together. Compact layouts
+switch deterministically among Stage, Settings, MIDI, and Console rather than compressing every
+surface into one unreadable column.
+
+Sound Settings is one persistent native `ModalScreen`. Textual's screen stack owns focus and input
+isolation; the modal backdrop owns outside-click dismissal while interactions inside the drawer
+remain contained. The same persistent synth rack distinguishes the loaded patch from the selected
+preset candidate and provides explicit Load, Reset, and Save New flows with validation feedback.
+
+## Codex Workflow
+
+Repository work is spec-driven and uses append-only, single-writer personal logs in
+`.codex/logs/`. The parent Codex session is the Coordinator and records routing, verified evidence,
+human gates, and wave completion in `.codex/logs/coordinator-{YYYY-MM-DD}.md`. The old
+`.codex/ledger/LEDGER.md` is historical only and must never be appended.
+
+`Atlas/` is a mechanically derived Campaign Atlas built from plans, personal logs, the active-plan
+pointer, and the agent roster. It is useful for navigation but never grants permission to unlock a
+wave or ship work. Preview or rebuild it with:
+
+```bash
+uv run .codex/skills/cartographer-map/scripts/build_vault.py --dry-run --root .
+uv run .codex/skills/cartographer-map/scripts/build_vault.py --root .
+```
 
 ## Validate
 
