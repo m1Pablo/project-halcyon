@@ -1,0 +1,268 @@
+name: One issue less a day keeps the bugs away
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+      timezone: America/Mexico_City
+  workflow_dispatch:
+
+concurrency:
+  group: one-issue-less-a-day
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+jobs:
+  issue-to-pr:
+    name: Fix one issue and open a PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out main without persisted credentials
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Prepare dependencies before sandboxing
+        run: |
+          uv python install 3.11
+          uv sync --locked --dev
+          uv run -- cargo fetch --manifest-path halcyon-audio/Cargo.toml
+
+      - name: Collect untrusted GitHub context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .codex-run
+          gh issue list \
+            --repo m1Pablo/project-halcyon \
+            --state open \
+            --limit 100 \
+            --json number,title,body,labels,url,createdAt,updatedAt \
+            > .codex-run/open-issues.json
+          gh pr list \
+            --repo m1Pablo/project-halcyon \
+            --state open \
+            --limit 100 \
+            --json number,title,body,url,headRefName \
+            > .codex-run/open-pull-requests.json
+          jq -e 'type == "array"' .codex-run/open-issues.json >/dev/null
+          jq -e 'type == "array"' .codex-run/open-pull-requests.json >/dev/null
+          echo "base_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Implement one issue with Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: .github/codex/one-issue-less-a-day.md
+          output-file: .codex-run/result.json
+          output-schema-file: .github/codex/one-issue-less-a-day.schema.json
+          sandbox: workspace-write
+          effort: high
+
+      - name: Interpret the structured result
+        id: outcome
+        run: |
+          jq -e . .codex-run/result.json >/dev/null
+          install -m 0600 .codex-run/result.json "$RUNNER_TEMP/daily-issue-result.json"
+          status=$(jq -r '.status' "$RUNNER_TEMP/daily-issue-result.json")
+          issue_number=$(jq -r '.issue_number' "$RUNNER_TEMP/daily-issue-result.json")
+          rm -rf .codex-run
+
+          case "$status" in
+            implemented)
+              if ! [[ "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Implemented result requires a positive issue number." >&2
+                exit 1
+              fi
+              if [[ -z "$(jq -r '.pr_title' "$RUNNER_TEMP/daily-issue-result.json")" ]]; then
+                echo "Implemented result requires a PR title." >&2
+                exit 1
+              fi
+              ;;
+            no_safe_issue)
+              if [[ -n "$(git status --porcelain)" ]]; then
+                echo "Codex changed the tree despite reporting no safe issue." >&2
+                git status --short
+                exit 1
+              fi
+              echo "### No safe issue today" >> "$GITHUB_STEP_SUMMARY"
+              echo "The run completed without creating a branch or pull request." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            blocked)
+              echo "### Daily issue run blocked" >> "$GITHUB_STEP_SUMMARY"
+              jq -r '.summary' "$RUNNER_TEMP/daily-issue-result.json" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+            *)
+              echo "Unknown terminal status: $status" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+
+      - name: Enforce issue and repository guardrails
+        if: steps.outcome.outputs.status == 'implemented'
+        env:
+          BASE_SHA: ${{ steps.context.outputs.base_sha }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.outcome.outputs.issue_number }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$BASE_SHA" ]]; then
+            echo "Codex changed Git history." >&2
+            exit 1
+          fi
+          if ! git diff --cached --quiet; then
+            echo "Codex staged changes; Git state must remain harness-owned." >&2
+            exit 1
+          fi
+
+          mapfile -d '' changed_files < <(
+            git ls-files --modified --deleted --others --exclude-standard -z
+          )
+          if (( ${#changed_files[@]} == 0 )); then
+            echo "Codex reported an implementation but produced no changes." >&2
+            exit 1
+          fi
+
+          for path in "${changed_files[@]}"; do
+            case "$path" in
+              .github/*|.codex/*|AGENTS.md|.gitignore)
+                echo "Protected path changed: $path" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          state=$(gh issue view "$ISSUE_NUMBER" \
+            --repo m1Pablo/project-halcyon \
+            --json state \
+            --jq '.state')
+          if [[ "$state" != "OPEN" ]]; then
+            echo "Issue #$ISSUE_NUMBER is no longer open." >&2
+            exit 1
+          fi
+
+          gh pr list \
+            --repo m1Pablo/project-halcyon \
+            --state open \
+            --limit 100 \
+            --json body \
+            > "$RUNNER_TEMP/current-open-prs.json"
+          if jq -e --arg issue "$ISSUE_NUMBER" '
+            any(.[].body // "";
+              test("(?i)(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]+#" + $issue + "([^0-9]|$)")
+            )
+          ' "$RUNNER_TEMP/current-open-prs.json" >/dev/null; then
+            echo "An open PR already claims issue #$ISSUE_NUMBER." >&2
+            exit 1
+          fi
+
+          printf '%s\0' "${changed_files[@]}" > "$RUNNER_TEMP/changed-files.zlist"
+
+      - name: Run independent scope-appropriate validation
+        if: steps.outcome.outputs.status == 'implemented'
+        run: |
+          mapfile -d '' changed_files < "$RUNNER_TEMP/changed-files.zlist"
+          python_changed=false
+          rust_changed=false
+
+          for path in "${changed_files[@]}"; do
+            case "$path" in
+              *.py|pyproject.toml|uv.lock)
+                python_changed=true
+                ;;
+            esac
+            case "$path" in
+              halcyon-audio/*)
+                rust_changed=true
+                ;;
+            esac
+          done
+
+          : > "$RUNNER_TEMP/validation-summary.md"
+          if [[ "$python_changed" == true ]]; then
+            uv run ruff format --check
+            uv run ruff check
+            uv run pytest
+            printf '%s\n' \
+              '- `uv run ruff format --check`' \
+              '- `uv run ruff check`' \
+              '- `uv run pytest`' \
+              >> "$RUNNER_TEMP/validation-summary.md"
+          fi
+
+          if [[ "$rust_changed" == true ]]; then
+            uv run -- cargo fmt --all --check --manifest-path halcyon-audio/Cargo.toml
+            uv run -- cargo clippy --manifest-path halcyon-audio/Cargo.toml --all-targets -- -D warnings
+            uv run -- cargo test --manifest-path halcyon-audio/Cargo.toml
+            printf '%s\n' \
+              '- `uv run -- cargo fmt --all --check --manifest-path halcyon-audio/Cargo.toml`' \
+              '- `uv run -- cargo clippy --manifest-path halcyon-audio/Cargo.toml --all-targets -- -D warnings`' \
+              '- `uv run -- cargo test --manifest-path halcyon-audio/Cargo.toml`' \
+              >> "$RUNNER_TEMP/validation-summary.md"
+          fi
+
+          if [[ ! -s "$RUNNER_TEMP/validation-summary.md" ]]; then
+            printf '%s\n' '- No Python or Rust gates were applicable.' \
+              > "$RUNNER_TEMP/validation-summary.md"
+          fi
+
+      - name: Commit, push, and open the pull request
+        if: steps.outcome.outputs.status == 'implemented'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.outcome.outputs.issue_number }}
+        run: |
+          mapfile -d '' changed_files < "$RUNNER_TEMP/changed-files.zlist"
+          branch="codex/issue-${ISSUE_NUMBER}-daily-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch -c "$branch"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "${changed_files[@]}"
+          if git diff --cached --quiet; then
+            echo "No staged implementation remains." >&2
+            exit 1
+          fi
+          git commit -m "fix(issue-${ISSUE_NUMBER}): resolve selected issue"
+
+          gh auth setup-git
+          git push --set-upstream origin "$branch"
+
+          pr_title=$(jq -r '.pr_title' "$RUNNER_TEMP/daily-issue-result.json" | head -c 240)
+          summary=$(jq -r '.summary' "$RUNNER_TEMP/daily-issue-result.json")
+          pr_body="$RUNNER_TEMP/pr-body.md"
+          {
+            printf '%s\n\n' "$summary"
+            printf '%s\n\n' '### Validation'
+            cat "$RUNNER_TEMP/validation-summary.md"
+            printf '\nCloses #%s\n' "$ISSUE_NUMBER"
+          } > "$pr_body"
+
+          pr_url=$(gh pr create \
+            --repo m1Pablo/project-halcyon \
+            --base main \
+            --head "$branch" \
+            --title "$pr_title" \
+            --body-file "$pr_body")
+          {
+            echo "### Pull request created"
+            echo "$pr_url"
+            echo
+            echo "Closes #$ISSUE_NUMBER"
+          } >> "$GITHUB_STEP_SUMMARY"

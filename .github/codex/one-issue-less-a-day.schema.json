@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "issue_number",
+    "issue_title",
+    "pr_title",
+    "summary",
+    "validations"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["implemented", "no_safe_issue", "blocked"]
+    },
+    "issue_number": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "issue_title": {
+      "type": "string",
+      "maxLength": 300
+    },
+    "pr_title": {
+      "type": "string",
+      "maxLength": 240
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "validations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      },
+      "maxItems": 20
+    }
+  }
+}
