@@ -10,19 +10,6 @@ __pycache__/
 # Local secrets and environment files.
 secrets.txt
 
-# Mechanically generated Campaign Atlas; preserve user notes locally, but never commit it.
-Atlas/
 .env
 .env.*
 !.env.example
-
-# Codex coordination artifacts are local working memory.
-.codex/plans/*
-.codex/ledger/*
-.codex/logs/*
-!.codex/plans/.gitkeep
-!.codex/ledger/.gitkeep
-!.codex/logs/.gitkeep
-
-# Synced third-party skills can be refreshed locally.
-.codex/skills/context_engineering/
