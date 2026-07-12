@@ -1,86 +1,54 @@
 ---
 name: logging-progress
-description: "Standardized logging protocol for Codex workflow agents. Defines personal logs and shared ledger entries."
+description: "Use for durable Codex workflow progress: append-only, single-writer personal logs with typed CLAIM, DONE, BLOCKER, GATE, READY, and WAVE_COMPLETE evidence; the coordinator log is the coordination spine and the old shared ledger is read-only history."
 ---
 
 # Logging Progress
 
-All workflow agents use this skill. Read it at session start and follow it throughout.
-
-## Filesystem Layout
-
-All paths are relative to the repo root.
+Read this skill at session start. Each participant writes only to its own dated log:
 
 ```text
-.codex/
-  plans/          # Architect writes plan/spec notes here
-  ledger/
-    LEDGER.md     # Shared high-signal coordination ledger
-  logs/
-    {agent}-{YYYY-MM-DD}.md
+.codex/logs/{agent-slug}-{YYYY-MM-DD}.md
 ```
 
-Create directories and files on first write if they do not exist. Never delete or overwrite existing entries; append only.
+Logs are append-only and single-writer. Never edit, reorder, or delete prior entries. Never write to another participant's log. Correct mistakes with a new entry.
 
-## When To Log
+`.codex/ledger/LEDGER.md` is historical read-only: never modify it and never require it for current state.
 
-Log at these moments:
+## Reading discipline
 
-- Immediately after claiming a session or subtask.
-- After meaningful discoveries or decisions.
-- When an artifact is created, modified, or deleted.
-- When a blocker appears or is resolved.
-- Before handoff to another agent or the user.
-- At session completion.
+Read your own log for today and only the exact entries named by a handoff (`{agent}-{YYYY-MM-DD}.md @ HH:MM`). Do not sweep unrelated logs. The coordinator log is the durable coordination spine and points to lane evidence needed for resumption.
 
-## Personal Log
-
-File: `.codex/logs/{agent-slug}-{YYYY-MM-DD}.md`
-
-Use this structure:
+## Entry format
 
 ```markdown
-## {YYYY-MM-DD HH:MM}
+## {YYYY-MM-DD HH:MM} | {EVENT}
 
-- **Task:** {session name or subtask}
-- **Status:** IN PROGRESS | BLOCKED | DONE
-- **Findings:** {observed facts; separate inference from fact}
-- **Decisions:** {choices made and why}
-- **Artifacts:** {files created, modified, or read}
-- **Blockers:** none | {description and proposed resolution}
-- **Next step:** {immediate next action}
+- **Task:** {lane or task}
+- **Plan:** {.codex/plans/{date}-{slug}.md | none ({reason})}
+- **Findings:** {observed facts; label inference}
+- **Decisions:** {choice and reason}
+- **Artifacts:** {exact paths, hashes, or checks}
+- **Blockers:** none | {failure, output, attempted remedy}
+- **Next:** {immediate next action}
 ```
 
-Keep entries short.
+Keep entries compact. `Plan:` is mandatory on `CLAIM`; later entries inherit it until another explicit plan or `Plan: none ({reason})`. A deliberate none stops inheritance. Shorthand such as “Wave 2” is valid only after the full plan path appears in the same log.
 
-## Shared Ledger
+## Typed events
 
-File: `.codex/ledger/LEDGER.md`
+| Event | Meaning | Writer |
+| --- | --- | --- |
+| `CLAIM` | work begins | any participant |
+| `NOTE` | meaningful progress or decision | any participant |
+| `BLOCKER` / `RESOLVED` | work stops / blocker clears | any participant |
+| `DONE` | owned work satisfies acceptance evidence | any participant |
+| `GATE` | human or prerequisite boundary | coordinator or responsible role |
+| `WAVE_COMPLETE` | all lanes evidenced; next wave unlocks | coordinator only |
+| `READY` | validated handoff is ready | coordinator, Shepherd, or Envoy |
 
-Mirror only coordination facts other agents or the user need. Do not copy full research notes.
+`DONE` must name concrete evidence matching the plan. `BLOCKER` must preserve the failing command, relevant output, and attempts. A returned lane with only `CLAIM` is stale: the coordinator may redispatch once with that failure context, then escalates.
 
-Events:
+Entries that pause or end work (`DONE`, `BLOCKER`, `GATE`, `WAVE_COMPLETE`) require `Next:`. End the final chat message with the exact log path and DONE/BLOCKER timestamp so the coordinator can verify without searching.
 
-| Event | When |
-| --- | --- |
-| `CLAIM` | Agent starts a session or subtask |
-| `BLOCKER` | A blocker may affect other work |
-| `RESOLVED` | A blocker is cleared |
-| `READY` | A deliverable is ready for the next agent |
-| `DONE` | A session or subtask completes with evidence |
-
-Format:
-
-```markdown
-## {YYYY-MM-DD HH:MM} | {AGENT} | {EVENT}
-
-{One to three lines. Who, what, and what it unblocks or requires.}
-```
-
-## Avoid
-
-- Logging every file read.
-- Keeping durable decisions only in chat.
-- Writing blockers only to a personal log.
-- Rewriting prior entries.
-- Making the ledger too noisy to scan.
+Never duplicate an entry elsewhere, keep decisions only in chat, log every file read, or end a working period without `DONE` or `BLOCKER`.
