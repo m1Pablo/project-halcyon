@@ -23,3 +23,6 @@ secrets.txt
 
 # Synced third-party skills can be refreshed locally.
 .codex/skills/context_engineering/
+
+# Mechanically generated Campaign Atlas; preserve user notes locally, but never commit it.
+Atlas/

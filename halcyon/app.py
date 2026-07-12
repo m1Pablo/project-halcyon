@@ -5,10 +5,11 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable, ClassVar, TypeVar
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import Button, DataTable, Footer, Static
 
 from halcyon.assistant import HalcyonAssistant, local_tool_executor
 from halcyon.audio_bridge import RustAudioBridge
@@ -28,9 +29,12 @@ from halcyon.mcp_local.run_tracker import RunTracker
 from halcyon.mcp_tools import ToolExecutionError
 from halcyon.midi import MidiEvent, MidiInput, MidiUnavailable
 from halcyon.midi import note_name as midi_note_name
+from halcyon.oscillator_scope import OscillatorScope, ScopeMode
 from halcyon.preset_store import UserPresetStore
+from halcyon.settings_screen import SoundSettingsScreen
 from halcyon.slash_commands import iter_slash_leaf_commands, resolve_slash_command
 from halcyon.synth_params import PRESETS, SynthPatch
+from halcyon.theme import HALCYON_THEME
 
 T = TypeVar("T")
 
@@ -54,10 +58,18 @@ class HalcyonApp(App[None]):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("r", "reconnect", "Reconnect"),
         Binding("c", "clear_log", "Clear"),
+        Binding("comma", "toggle_settings", "Sound settings", priority=True),
+        Binding("ctrl+s", "toggle_settings", "Sound settings", priority=True),
+        Binding("f1", "workspace('stage')", "Stage", show=False),
+        Binding("f2", "workspace('controls')", "Controls", show=False),
+        Binding("f3", "workspace('activity')", "Activity", show=False),
+        Binding("f4", "workspace('console')", "Console", show=False),
     ]
 
     def __init__(self, *, preset_store: UserPresetStore | None = None) -> None:
         super().__init__()
+        self.register_theme(HALCYON_THEME)
+        self.theme = HALCYON_THEME.name
         self.midi = MidiInput()
         self.audio = RustAudioBridge()
         self.user_preset_store = preset_store or UserPresetStore.load()
@@ -71,13 +83,20 @@ class HalcyonApp(App[None]):
         self.target_notes: set[int] = set()
         self.event_log = MidiEventLog(max_events=200)
         self.event_count = 0
+        self._midi_source = "MIDI offline"
+        self._size_class = ""
+        self._workspace = "stage"
+        self._resources_closed = False
         self.status = Static("Starting MIDI monitor...", id="status")
         self.audio_status = Static("Audio: starting Rust sidecar...", id="audio-status")
+        self.status_rail = Static("HALCYON · starting", id="status-rail")
         self.synth_rack = SynthRack(
             self.synth_patch,
             user_presets=self.user_preset_store.presets,
             id="synth-rack",
         )
+        self.settings_screen = SoundSettingsScreen(self.synth_rack)
+        self.install_screen(self.settings_screen, "sound-settings")
         self.chat_panel = ChatPanel(
             enabled=self.assistant.enabled,
             menu_def=self.menu_def,
@@ -88,51 +107,143 @@ class HalcyonApp(App[None]):
         self.keyboard = VirtualKeyboard(id="keyboard")
         self.keyboard_scroll = HorizontalScroll(id="keyboard-scroll")
         self.event_table = DataTable(id="event-log", zebra_stripes=True)
+        self.scope = OscillatorScope(self.audio_visualization_snapshot, id="oscillator-scope")
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
         with Vertical(id="app-shell"):
-            yield Static("Project Halcyon", id="title")
-            with Horizontal(id="workspace"):
-                with Vertical(id="monitor-panel"):
-                    yield Static("Input", id="input-title", classes="section-title")
-                    yield self.status
-                    yield Static("Audio sidecar", id="audio-title", classes="section-title")
-                    yield self.audio_status
-                with Vertical(id="log-panel"):
-                    yield Static("MIDI event log", id="log-title", classes="section-title")
-                    yield self.event_table
-            yield Static(
-                "Akai LPK25 Wireless",
-                id="keyboard-title",
-                classes="section-title",
-            )
-            with self.keyboard_scroll:
-                yield self.keyboard
-            yield Static("Synth", id="synth-title", classes="section-title")
-            yield self.synth_rack
-            yield Static("Assistant", id="chat-title", classes="section-title")
-            yield self.chat_panel
+            yield self.status_rail
+            # Compatibility status surfaces remain queryable while the rail owns display.
+            yield self.status
+            yield self.audio_status
+            with Horizontal(id="compact-nav"):
+                yield Button("Stage  F1", id="workspace-stage", compact=True)
+                yield Button("Settings  F2", id="workspace-controls", compact=True)
+                yield Button("MIDI  F3", id="workspace-activity", compact=True)
+                yield Button("Console  F4", id="workspace-console", compact=True)
+            with Vertical(id="workspace-host"):
+                with Horizontal(id="main-workspace"):
+                    with Vertical(id="performance-stage", classes="workspace-pane"):
+                        with Horizontal(id="scope-toolbar"):
+                            yield Static("OSCILLATOR", classes="panel-title")
+                            yield Button("Wave", id="scope-wave", compact=True)
+                            yield Button("Orbit", id="scope-orbit", compact=True)
+                            yield Button("Radial", id="scope-radial", compact=True)
+                        yield self.scope
+                        yield Static(
+                            "PERFORMANCE · Akai LPK25 Wireless",
+                            id="keyboard-title",
+                            classes="panel-title",
+                        )
+                        with self.keyboard_scroll:
+                            yield self.keyboard
+                    with Vertical(id="activity-panel", classes="workspace-pane"):
+                        yield Static("MIDI ACTIVITY", classes="panel-title")
+                        yield self.event_table
+                with Vertical(id="command-console", classes="workspace-pane"):
+                    yield Static(
+                        "COMMAND CONSOLE · Enter run · Shift+Enter newline · Tab complete",
+                        classes="panel-title",
+                    )
+                    yield self.chat_panel
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = "Project Halcyon"
-        self.sub_title = "Textual MIDI logger"
+        self.title = "Halcyon"
+        self.sub_title = "Performance cockpit"
         self.event_table.cursor_type = "none"
         self.event_table.add_columns(
             "Time", "Event", "Note", "Vel", "Ch", "Status", "Delta", "Source"
         )
         self.keyboard.update_keys(self.pressed_notes)
+        self._apply_size_class(self.size.width, self.size.height)
+        self.action_workspace("stage")
+        self._refresh_scope_buttons()
         self._start_audio()
         self._start_local_control_server()
         self._connect_midi()
         self.set_interval(0.02, self._poll_midi)
         self.set_interval(0.5, self._refresh_audio_status)
 
-    def on_shutdown(self) -> None:
-        self.local_control_server.stop()
-        self.audio.close()
-        self.midi.close()
+    def on_resize(self, event: events.Resize) -> None:
+        self._apply_size_class(event.size.width, event.size.height)
+
+    def _apply_size_class(self, width: int, height: int) -> None:
+        if width < 110 or height < 36:
+            size_class = "-compact"
+        elif width < 150 or height < 48:
+            size_class = "-medium"
+        else:
+            size_class = "-wide"
+        if size_class == self._size_class or not self.is_mounted:
+            return
+        for candidate in ("-wide", "-medium", "-compact"):
+            self.screen.set_class(candidate == size_class, candidate)
+        self._size_class = size_class
+
+    def action_workspace(self, workspace: str) -> None:
+        if workspace not in {"stage", "controls", "activity", "console"}:
+            return
+        if workspace == "controls":
+            self.action_toggle_settings()
+            return
+        self._workspace = workspace
+        if not self.is_mounted:
+            return
+        shell = self.query_one("#app-shell", Vertical)
+        for candidate in ("stage", "controls", "activity", "console"):
+            shell.set_class(candidate == workspace, f"workspace-{candidate}")
+            button = self.query_one(f"#workspace-{candidate}", Button)
+            button.set_class(candidate == workspace, "selected")
+
+    def action_toggle_settings(self) -> None:
+        """Compatibility action: open the one persistent modal idempotently."""
+        if self.screen is not self.settings_screen:
+            self.push_screen(self.settings_screen)
+
+    def action_close_settings(self) -> None:
+        """Compatibility action delegated to the active modal lifecycle."""
+        if self.screen is self.settings_screen:
+            self.settings_screen.dismiss()
+
+    def on_button_pressed(self, message: Button.Pressed) -> None:
+        button_id = str(message.button.id or "")
+        if button_id.startswith("workspace-"):
+            message.stop()
+            self.action_workspace(button_id.removeprefix("workspace-"))
+            return
+        scope_modes = {
+            "scope-wave": ScopeMode.WAVE,
+            "scope-orbit": ScopeMode.ORBIT,
+            "scope-radial": ScopeMode.RADIAL,
+        }
+        if button_id in scope_modes:
+            message.stop()
+            self.scope.set_mode(scope_modes[button_id])
+            self._refresh_scope_buttons()
+
+    def _refresh_scope_buttons(self) -> None:
+        if not self.is_mounted:
+            return
+        for mode in ScopeMode:
+            button = self.query_one(f"#scope-{mode.value}", Button)
+            button.set_class(self.scope.mode is mode, "selected")
+
+    def on_unmount(self) -> None:
+        """Release app-owned resources once at Textual's public exit boundary."""
+        if self._resources_closed:
+            return
+        self._resources_closed = True
+
+        cleanups = (
+            ("local control server", self.local_control_server.stop),
+            ("audio bridge", self.audio.close),
+            ("MIDI input", self.midi.close),
+        )
+        for resource_name, cleanup in cleanups:
+            try:
+                cleanup()
+            except Exception as exc:
+                self.log.error(f"Failed to close {resource_name}: {exc}")
 
     def action_reconnect(self) -> None:
         self.audio.all_notes_off()
@@ -143,6 +254,7 @@ class HalcyonApp(App[None]):
         self.event_table.clear()
         self.event_log.clear()
         self.event_count = 0
+        self._refresh_status_rail()
 
     def _connect_midi(self) -> None:
         try:
@@ -150,13 +262,19 @@ class HalcyonApp(App[None]):
             port = self.midi.connect()
         except MidiUnavailable as exc:
             self.status.update(f"[disconnected] {exc} Press r to retry.")
+            self._midi_source = "MIDI offline"
+            self._refresh_status_rail()
             return
         except Exception as exc:
             self.status.update(f"[error] MIDI connection failed: {exc}. Press r to retry.")
+            self._midi_source = "MIDI error"
+            self._refresh_status_rail()
             return
 
         port_list = ", ".join(ports) if ports else "none"
         self.status.update(f"Input: {port}\nAvailable: {port_list}")
+        self._midi_source = port
+        self._refresh_status_rail()
 
     def _start_audio(self) -> None:
         self.audio.start()
@@ -173,6 +291,31 @@ class HalcyonApp(App[None]):
 
     def _refresh_audio_status(self) -> None:
         self.audio_status.update(self.audio.snapshot().text)
+        self._refresh_status_rail()
+
+    def _refresh_status_rail(self) -> None:
+        if not self.is_mounted:
+            return
+        audio = self.audio.snapshot()
+        try:
+            viz = self.audio_visualization_snapshot()
+        except Exception:
+            viz = None
+        audio_label = "AUDIO ready" if audio.ready else "AUDIO wait"
+        viz_label = "VIZ linked" if viz is not None and viz.connected else "VIZ offline"
+        preset = self.synth_patch.preset_name or "custom"
+        self.status_rail.update(
+            "  ".join(
+                (
+                    "[b]HALCYON[/b]",
+                    f"MIDI {self._midi_source}",
+                    audio_label,
+                    viz_label,
+                    f"PATCH {preset}",
+                    f"EVENTS {self.event_count}",
+                )
+            )
+        )
 
     def _poll_midi(self) -> None:
         if not self.midi.connected:
@@ -216,6 +359,7 @@ class HalcyonApp(App[None]):
             first_key = next(iter(self.event_table.rows.keys()))
             self.event_table.remove_row(first_key)
         self.event_table.move_cursor(row=len(self.event_table.rows) - 1)
+        self._refresh_status_rail()
 
     def _scroll_keyboard_to(self, note: int) -> None:
         scroll_x = scroll_target_for_note(
@@ -228,19 +372,24 @@ class HalcyonApp(App[None]):
 
     def on_synth_rack_param_changed(self, message: SynthRack.ParamChanged) -> None:
         self._apply_dsp_patch(message.dsp_patch)
+        self._refresh_status_rail()
 
     def on_synth_rack_preset_applied(self, message: SynthRack.PresetApplied) -> None:
         self._apply_dsp_patch(message.dsp_patch)
         self.chat_panel.write_system(f"Patch: {message.preset_name}")
+        self._refresh_status_rail()
 
     def on_synth_rack_preset_saved(self, message: SynthRack.PresetSaved) -> None:
         try:
             self.user_preset_store.save(message.preset_name, message.values)
         except ValueError as exc:
             self.chat_panel.write_system(f"Preset save failed: {exc}")
+            self.synth_rack.preset_save_failed(str(exc))
             return
         self.synth_rack.set_user_presets(self.user_preset_store.presets)
+        self.synth_rack.preset_save_succeeded(message.preset_name)
         self.chat_panel.write_system(f"Saved patch: {message.preset_name}")
+        self._refresh_status_rail()
 
     def on_chat_panel_submitted(self, message: ChatPanel.Submitted) -> None:
         self.chat_panel.write_user(message.text)

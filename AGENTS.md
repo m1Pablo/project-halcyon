@@ -12,21 +12,24 @@ Project Halcyon is a Python MIDI controller/synth/drum experiment moving from a 
 - `Modules/synth.py` - original synth flow, currently incomplete.
 - `halcyon/` - new package location for the next Textual iteration.
 - `halcyon-audio/` - Rust workspace for the realtime oscillator sidecar and DSP core.
-- `.codex/agents/` - Codex-native workflow roles.
+- `.codex/agents/*.toml` - project-scoped Codex custom-agent definitions.
 - `.codex/commands/` - reusable local command notes.
 - `.codex/skills/` - local workflow skills and synced Context Engineering skills.
-- `.codex/plans/`, `.codex/ledger/`, `.codex/logs/` - local coordination memory; never commit generated contents.
+- `.codex/plans/`, `.codex/logs/` - local plan and single-writer progress memory; never commit generated contents.
+- `.codex/ledger/LEDGER.md` - historical archive only; never append or use as current authority.
+- `Atlas/` - mechanically derived Campaign Atlas; generated contents are ignored.
 
 ## Workflow Contract
 
 Work is spec-driven:
 
 1. The Architect writes a plan/spec note in `.codex/plans/` and updates `.codex/plans/ACTIVE_PLAN.md`.
-2. The Coordinator routes implementation waves from the active plan and records progress in `.codex/ledger/LEDGER.md`.
-3. Implementers change code only within their owned files and log `CLAIM`, `BLOCKER`, and `DONE` evidence.
-4. The Envoy ships completed work when the user asks for git operations.
+2. The parent Codex session acts as Coordinator, routes focused implementation waves, and records decisions in `.codex/logs/coordinator-{YYYY-MM-DD}.md`.
+3. Each participant writes only its own append-only personal log. Implementers change only owned files and record `CLAIM`, `BLOCKER`, and evidenced `DONE` entries.
+4. The Coordinator verifies exact lane-log entries before unlocking a wave or stopping at a declared human gate.
+5. The Envoy ships completed work only when the user asks for git operations.
 
-There is no Sentinel gate in this repo. Security/release risk is handled by ordinary validation, code review, and explicit human approval.
+Personal logs are authoritative and the coordinator log is the coordination spine. The Campaign Atlas is derived and never grants permission to unlock, ship, or skip a gate. Security and release risk use ordinary validation, code review, and explicit human approval.
 
 ## Git Workflow
 
