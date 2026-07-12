@@ -1,250 +1,92 @@
-Screen {
-    background: #111317;
-    color: #eceff4;
-}
+Screen { background: $background; color: $foreground; layers: base overlay; }
+Footer { height: 1; background: $surface; color: $halcyon-muted; }
+#app-shell { height: 1fr; padding: 0 1; background: $background; }
+#status-rail { height: 1; padding: 0 1; background: $surface; color: $halcyon-muted; }
+#status, #audio-status { display: none; }
+.panel-title { height: 1; color: $halcyon-muted; text-style: bold; content-align: left middle; }
+#workspace-host, #main-workspace { height: 1fr; width: 100%; }
+#main-workspace { layout: horizontal; }
+.workspace-pane { background: $surface; border: tall $halcyon-line; }
+#performance-stage { width: 1fr; min-width: 44; height: 100%; margin-right: 1; }
+#scope-toolbar { height: 3; padding-left: 1; border-bottom: solid $halcyon-line; }
+#scope-toolbar .panel-title { width: 1fr; }
+#scope-toolbar Button { width: 9; min-width: 7; height: 3; border: none; background: transparent; color: $halcyon-muted; }
+#scope-toolbar Button.selected, #compact-nav Button.selected { color: $halcyon-active; text-style: bold; background: $boost; }
+#oscillator-scope { height: 1fr; min-height: 7; color: $halcyon-viz; background: $surface; }
+#keyboard-title { height: 2; padding-left: 1; color: $halcyon-midi; border-top: solid $halcyon-line; }
+#keyboard-scroll { width: 100%; height: 12; background: $surface; overflow-x: auto; overflow-y: hidden; }
+#keyboard { width: 527; height: 11; padding: 0; background: $surface; }
+#activity-panel { width: 48; min-width: 31; height: 100%; padding: 0 1; }
+#event-log { height: 1fr; width: 100%; background: $surface; border: none; }
 
-Header {
-    background: #1d252c;
-    color: #eceff4;
-}
+SoundSettingsScreen { background: $background 58%; }
+#settings-drawer { dock: right; width: 76; height: 100%; background: $panel; border-left: tall $halcyon-active; }
+#settings-header { height: 6; padding: 1 2; border-bottom: solid $halcyon-line; }
+#settings-heading { width: 1fr; height: 4; }
+#settings-header #close-settings { width: 13; height: 3; border: none; }
+#settings-scroll { height: 1fr; padding: 0 2 2 2; }
+#synth-rack { height: auto; width: 100%; background: $panel; }
+.settings-section-title { height: 3; margin-top: 1; color: $halcyon-active; text-style: bold; content-align: left middle; border-bottom: solid $halcyon-line; }
+.settings-subtitle { height: 2; color: $halcyon-midi; text-style: bold; }
+.settings-help { height: auto; min-height: 1; color: $halcyon-muted; }
+#preset-loaded-state { height: 3; padding: 1; color: $halcyon-midi; text-style: bold; }
+#preset-help { height: 2; color: $halcyon-muted; }
+#preset-list { height: auto; }
+#preset-list Button { width: 100%; height: 3; border: none; background: $surface; color: $foreground; content-align: left middle; text-align: left; }
+#preset-list Button.candidate { background: $boost; border-left: thick $halcyon-active; }
+#preset-list Button.loaded { color: $halcyon-midi; text-style: bold; }
+#preset-actions, .save-actions { height: 4; margin-top: 1; }
+#preset-actions Button, .save-actions Button { width: 1fr; height: 4; min-width: 10; }
+#preset-save-flow { height: auto; margin-top: 1; padding: 1; background: $surface; border: tall $halcyon-line; }
+#preset-name-input { width: 100%; height: 4; }
+#preset-feedback { height: 2; color: $success; }
+#preset-feedback.error { color: $error; }
+#knob-row { height: auto; }
+SynthKnob { width: 100%; height: 8; padding: 1; color: $foreground; background: $surface; border-bottom: solid $halcyon-line; layout: horizontal; }
+SynthKnob:focus { border: tall $halcyon-active; background: $boost; }
+.knob-copy { width: 1fr; height: 5; }
+.knob-label { height: 1; color: $foreground; text-style: bold; }
+.knob-help { height: 2; color: $halcyon-muted; }
+.knob-value { width: 12; height: 5; content-align: right middle; color: $halcyon-midi; }
+.knob-adjust-row { height: 5; width: 28; }
+.knob-step { width: 5; min-width: 5; height: 5; border: none; background: $boost; color: $foreground; }
+.knob-meter { width: 1fr; height: 5; content-align: center middle; background: $panel; color: $halcyon-active; }
 
-Footer {
-    background: #1d252c;
-    color: #a7b1bc;
-}
+#command-console { height: 12; min-height: 8; margin-top: 1; padding: 0 1; }
+#chat-panel { height: 1fr; background: $surface; }
+#chat-log { height: 1fr; padding: 0 1; background: $surface; }
+#chat-slash-hint { height: 1; padding: 0 1; color: $halcyon-target; background: $surface; }
+#chat-input-row { height: 4; width: 100%; border-top: solid $halcyon-line; background: $background; }
+#chat-prompt { width: 6; height: 4; content-align: center middle; color: $halcyon-midi; text-style: bold; }
+#chat-input { width: 1fr; height: 4; border: none; background: $background; color: $foreground; }
+#chat-input:focus { background: $panel; }
+#chat-send { width: 9; min-width: 8; height: 4; border: none; background: $boost; color: $halcyon-active; }
+#compact-nav { display: none; }
 
-#app-shell {
-    height: 1fr;
-    padding: 1 2 0 2;
-}
+Screen.-medium #performance-stage { width: 1fr; }
+Screen.-medium #activity-panel { width: 32; min-width: 28; }
+Screen.-medium #command-console { height: 9; }
+Screen.-medium #keyboard-scroll { height: 9; }
+Screen.-medium #keyboard { height: 8; }
+SoundSettingsScreen.-medium #settings-drawer { width: 68; }
 
-#title {
-    height: 1;
-    content-align: left middle;
-    text-style: bold;
-    color: #f0b429;
-}
-
-#workspace {
-    height: 10;
-    min-height: 10;
-    max-height: 10;
-    width: 100%;
-    layout: horizontal;
-}
-
-#monitor-panel {
-    width: 38%;
-    min-width: 34;
-    padding-right: 1;
-    height: 100%;
-}
-
-#log-panel {
-    width: 1fr;
-    min-width: 40;
-    height: 100%;
-    padding-left: 1;
-}
-
-#status {
-    height: 4;
-    padding: 0 1;
-    border: solid #3a4450;
-    background: #171b21;
-}
-
-#audio-status {
-    height: 3;
-    padding: 0 1;
-    border: solid #3a4450;
-    background: #171b21;
-}
-
-.section-title {
-    height: 1;
-    margin-top: 0;
-    margin-bottom: 0;
-    color: #95d5b2;
-    text-style: bold;
-    content-align: left middle;
-}
-
-#input-title,
-#log-title {
-    margin-top: 0;
-    margin-left: 0;
-    padding-left: 0;
-}
-
-#keyboard-title {
-    padding-left: 0;
-}
-
-#keyboard-scroll {
-    width: 100%;
-    max-width: 212;
-    height: 11;
-    border: solid #3a4450;
-    background: #171b21;
-    overflow-x: auto;
-    overflow-y: hidden;
-}
-
-#keyboard {
-    width: 527;
-    height: 9;
-    padding: 0;
-    background: #171b21;
-}
-
-#synth-rack {
-    height: 13;
-    border: solid #3a4450;
-    background: #181d22;
-    padding: 0 1;
-}
-
-.synth-rack-inner {
-    height: 100%;
-}
-
-#knob-row {
-    height: 8;
-    align-horizontal: left;
-}
-
-SynthKnob {
-    width: 18;
-    height: 7;
-    margin-right: 1;
-    padding: 0 1;
-    color: #e7eadf;
-    background: #222932;
-    border: round #4d5b66;
-}
-
-SynthKnob:focus {
-    border: round #e0a458;
-    background: #2c333b;
-}
-
-.knob-label {
-    height: 1;
-    content-align: center middle;
-    text-style: bold;
-    color: #f1f5dc;
-}
-
-.knob-value {
-    height: 1;
-    content-align: center middle;
-    color: #95d5b2;
-}
-
-.knob-adjust-row {
-    height: 3;
-    width: 100%;
-    align-horizontal: center;
-}
-
-.knob-step {
-    width: 3;
-    min-width: 3;
-    height: 3;
-    content-align: center middle;
-    background: #253141;
-    color: #eceff4;
-}
-
-.knob-meter {
-    width: 1fr;
-    height: 3;
-    content-align: center middle;
-    background: #171b21;
-    color: #e0a458;
-}
-
-#preset-row {
-    height: 4;
-    padding-top: 0;
-    align-horizontal: left;
-}
-
-#preset-row Button {
-    width: 12;
-    min-width: 10;
-    height: 3;
-    margin-right: 1;
-    content-align: center middle;
-    background: #253141;
-    color: #e7eadf;
-}
-
-#preset-save {
-    width: 11;
-    background: #334155;
-}
-
-#preset-save.save-armed {
-    background: #684b24;
-    color: #fff4d6;
-}
-
-#preset-row Button.empty-preset {
-    color: #a7b1bc;
-    background: #202833;
-}
-
-#preset-row Button.saved-preset {
-    color: #f1f5dc;
-    background: #2e3f34;
-}
-
-#chat-panel {
-    height: 1fr;
-    min-height: 8;
-    border: solid #3a4450;
-    background: #15191e;
-}
-
-#chat-log {
-    height: 1fr;
-    padding: 0 1;
-    background: #15191e;
-}
-
-#chat-input-row {
-    height: 3;
-    width: 100%;
-    border-top: solid #3a4450;
-    background: #101418;
-}
-
-#chat-prompt {
-    width: 6;
-    height: 3;
-    content-align: center middle;
-    color: #95d5b2;
-    text-style: bold;
-}
-
-#chat-input {
-    width: 1fr;
-    height: 3;
-    border: none;
-    background: #101418;
-}
-
-#chat-send {
-    width: 9;
-    min-width: 8;
-    height: 3;
-}
-
-#event-log {
-    height: 1fr;
-    margin-top: 0;
-    border: solid #3a4450;
-    background: #171b21;
-}
+Screen.-compact Footer { display: none; }
+Screen.-compact #app-shell { padding: 0; }
+Screen.-compact #compact-nav { display: block; height: 3; layout: horizontal; background: $background; }
+Screen.-compact #compact-nav Button { width: 1fr; height: 3; min-width: 10; border: none; background: $surface; color: $halcyon-muted; }
+Screen.-compact #workspace-host, Screen.-compact #main-workspace { height: 1fr; }
+Screen.-compact #main-workspace > .workspace-pane { display: none; }
+Screen.-compact #command-console { display: none; }
+Screen.-compact #app-shell.workspace-stage #performance-stage, Screen.-compact #app-shell.workspace-activity #activity-panel { display: block; width: 100%; min-width: 0; height: 100%; margin: 0; }
+Screen.-compact #app-shell.workspace-console #main-workspace { display: none; }
+Screen.-compact #app-shell.workspace-console #command-console { display: block; width: 100%; height: 100%; min-height: 0; margin: 0; }
+Screen.-compact #keyboard-scroll { height: 8; }
+Screen.-compact #keyboard { height: 7; }
+Screen.-compact #command-console .panel-title { display: none; }
+Screen.-compact #chat-input-row, Screen.-compact #chat-input { height: 5; }
+SoundSettingsScreen.-compact #settings-drawer { width: 100%; border-left: none; }
+SoundSettingsScreen.-compact #settings-header { height: 5; padding: 0 1; }
+SoundSettingsScreen.-compact #settings-heading .settings-help { display: none; }
+SoundSettingsScreen.-compact #settings-scroll { padding: 0 1 1 1; }
+SoundSettingsScreen.-compact SynthKnob { height: 10; layout: grid; grid-size: 2 2; grid-columns: 1fr 12; grid-rows: 4 5; }
+SoundSettingsScreen.-compact .knob-adjust-row { width: 100%; column-span: 2; }

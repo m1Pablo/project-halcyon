@@ -37,7 +37,8 @@ Near-term target:
 - The next iteration adds Rust sound output through `halcyon-audio/`; Python remains the MIDI/UI control plane.
 - Current synth controls are Python-owned patch state streamed to Rust via `set_param`; keep the parameter registry in `halcyon/synth_params.py` as the UI/tooling source of truth.
 - User synth presets are saved outside the repository through `halcyon/preset_store.py`.
-- The OpenAI assistant and local MCP bridge may only expose the safe synth tools in `halcyon/mcp_tools.py`, including preset save/load but no shell, file, MIDI-device, or arbitrary network access.
+- `halcyon/menu.xml` is the public command ABI for chat and MCP. The OpenAI assistant may only route natural language to registered slash commands or reject; it must not call raw synth tools directly.
+- The local MCP bridge may only expose command-control tools: `list_commands`, `run_slash_command`, `get_run_status`, `get_run_logs`, and `get_app_state`. Safe synth tools in `halcyon/mcp_tools.py` remain internal slash-command leaves, including preset save/load but no shell, file, MIDI-device, or arbitrary network access.
 
 ## Validation Policy
 
@@ -74,7 +75,8 @@ Until the repo has a full test harness, run the narrowest available `uv run ...`
 - Visualization frames are raw `HZV1` + little-endian `u32` count + little-endian `f32` samples. Keep sending best-effort and off the audio thread.
 - Keep audio callback code realtime-safe: no blocking calls, logging, heap allocation, or locks in the CPAL callback.
 - Keep OpenAI usage environment-only. Do not read `.env`, print API keys, or use live OpenAI calls in automated tests.
-- Local MCP control must bind to `127.0.0.1` and expose only synth state/parameter/preset/all-notes-off tools.
+- Local MCP control must bind to `127.0.0.1` and expose only command-control tools. Do not re-advertise raw synth tools through the public HTTP or stdio MCP surfaces.
+- New chat or MCP actions must be added first to `halcyon/menu.xml`; update the command executor/router tests so slash autocomplete, LLM routing, and MCP command listing stay derived from the same registry.
 - Preset persistence must keep built-in presets read-only and write user presets outside the repo unless a test explicitly overrides `HALCYON_PRESETS_PATH`.
 - Textual CSS is not web CSS. Verify with the Textual app, not browser assumptions.
 - Do not commit secrets, generated logs, local plans, or downloaded third-party skill copies.

@@ -1,4 +1,4 @@
-"""Tiny localhost HTTP control server for safe Halcyon synth tools."""
+"""Tiny localhost HTTP control server for MCP slash-command control."""
 
 from __future__ import annotations
 
@@ -7,11 +7,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlparse
 import weakref
-
-from halcyon.mcp_tools import ToolExecutionError, execute_tool, tool_definitions
 
 if TYPE_CHECKING:
     from halcyon.app import HalcyonApp
@@ -25,6 +23,8 @@ def _resolve_port(preferred: int, host: str) -> int:
                 sock.bind((host, candidate))
             except OSError:
                 continue
+            if candidate == 0:
+                return int(sock.getsockname()[1])
             return candidate
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
@@ -46,7 +46,7 @@ class _ControlHTTPServer(ThreadingHTTPServer):
 
 
 class LocalControlServer:
-    """Localhost control server exposing the safe synth tool executor."""
+    """Localhost control server exposing registered slash-command operations."""
 
     def __init__(
         self,
@@ -114,14 +114,45 @@ class LocalControlServer:
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
 
-    def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _app(self) -> "HalcyonApp":
         app = self._app_ref()
         if app is None:
-            raise ToolExecutionError("app is not available")
+            raise RuntimeError("app is not available")
+        return app
+
+    def _call_app(self, callback: Callable[["HalcyonApp"], Any]) -> Any:
+        app = self._app()
         call_from_thread = getattr(app, "call_from_thread", None)
         if callable(call_from_thread):
-            return call_from_thread(lambda: execute_tool(app, name, arguments or {}))
-        return execute_tool(app, name, arguments or {})
+            return call_from_thread(lambda: callback(app))
+        return callback(app)
+
+    def list_commands(self) -> list[dict[str, Any]]:
+        return self._call_app(lambda app: app.mcp_local_list_commands())
+
+    def app_state(self) -> dict[str, Any]:
+        return self._call_app(lambda app: app.mcp_local_state())
+
+    def run_slash(
+        self,
+        *,
+        command: str,
+        source: str,
+        timeout_s: float | None,
+    ) -> tuple[int, dict[str, Any]]:
+        return self._call_app(
+            lambda app: app.mcp_local_run_slash(
+                command=command,
+                source=source,
+                timeout_s=timeout_s,
+            )
+        )
+
+    def run_status(self, run_id: str) -> dict[str, Any] | None:
+        return self._call_app(lambda app: app.mcp_local_run_status(run_id))
+
+    def run_logs(self, run_id: str) -> dict[str, Any] | None:
+        return self._call_app(lambda app: app.mcp_local_run_logs(run_id))
 
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         control = self
@@ -163,46 +194,62 @@ class LocalControlServer:
                             "ok": True,
                             "host": control.host,
                             "port": control.port,
-                            "tools": len(tool_definitions()),
+                            "commands": len(control.list_commands()),
                         },
                     )
                     return
-                if path == "/tools":
-                    self._json(HTTPStatus.OK, {"tools": tool_definitions()})
+                if path == "/commands":
+                    self._json(HTTPStatus.OK, {"commands": control.list_commands()})
                     return
                 if path == "/state":
-                    self._handle_tool("get_synth_state", {})
+                    self._json(HTTPStatus.OK, control.app_state())
+                    return
+                if path.startswith("/run_status/"):
+                    run_id = path.removeprefix("/run_status/").strip()
+                    self._handle_lookup(control.run_status(run_id))
+                    return
+                if path.startswith("/run_logs/"):
+                    run_id = path.removeprefix("/run_logs/").strip()
+                    self._handle_lookup(control.run_logs(run_id))
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urlparse(self.path).path
                 payload = self._read_json()
-                if path == "/tools/call":
-                    name = str(payload.get("name", "")).strip()
-                    arguments = payload.get("arguments")
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                    self._handle_tool(name, arguments)
-                    return
-                if path.startswith("/tool/"):
-                    name = path.removeprefix("/tool/").strip()
-                    self._handle_tool(name, payload)
+                if path == "/run_slash":
+                    command = str(payload.get("command", "")).strip()
+                    if not command:
+                        self._json(HTTPStatus.BAD_REQUEST, {"error": "command is required"})
+                        return
+                    source = str(payload.get("source", "llm")).strip()
+                    timeout_s = self._optional_float(payload.get("timeout_s"))
+                    try:
+                        status, result = control.run_slash(
+                            command=command,
+                            source=source,
+                            timeout_s=timeout_s,
+                        )
+                    except Exception as exc:
+                        self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+                        return
+                    self._json(status, result)
                     return
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
-            def _handle_tool(self, name: str, arguments: dict[str, Any]) -> None:
-                if not name:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": "tool name is required"})
+            def _handle_lookup(self, payload: dict[str, Any] | None) -> None:
+                if payload is None:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "run not found"})
                     return
+                self._json(HTTPStatus.OK, payload)
+
+            @staticmethod
+            def _optional_float(value: Any) -> float | None:
+                if value is None:
+                    return None
                 try:
-                    result = control.call_tool(name, arguments)
-                except ToolExecutionError as exc:
-                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-                    return
-                except Exception as exc:
-                    self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
-                    return
-                self._json(HTTPStatus.OK, {"result": result})
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
 
         return Handler

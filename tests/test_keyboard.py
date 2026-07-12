@@ -42,7 +42,7 @@ def test_pressed_key_style_is_distinct() -> None:
     idle_style = key_style(60, set())
 
     assert pressed_style != idle_style
-    assert "#95d5b2" in pressed_style
+    assert "#ff9f43" in pressed_style
 
 
 def test_keyboard_geometry_is_fixed_width_and_ordered() -> None:

@@ -60,7 +60,10 @@ def test_knob_keypress_updates_patch_and_streams_to_audio(monkeypatch) -> None:
         app.midi = FakeMidi()  # type: ignore[assignment]
 
         async with app.run_test() as pilot:
-            tone = app.query_one("#knob-tone", SynthKnob)
+            await pilot.press("comma")
+            await pilot.pause()
+            assert app.screen is app.settings_screen
+            tone = app.settings_screen.query_one("#knob-tone", SynthKnob)
             tone.focus()
             before = len(fake_audio.patches)
             await pilot.press("right")
@@ -83,11 +86,16 @@ def test_knob_buttons_increment_and_decrement(monkeypatch) -> None:
         app.midi = FakeMidi()  # type: ignore[assignment]
 
         async with app.run_test(size=(180, 52)) as pilot:
+            await pilot.press("comma")
+            await pilot.pause()
+            assert app.screen is app.settings_screen
+            app.settings_screen.query_one("#knob-volume-up").focus()
             before = app.synth_patch.values["volume"]
-            await pilot.click("#knob-volume-up")
+            await pilot.press("enter")
             await pilot.pause()
             after_up = app.synth_patch.values["volume"]
-            await pilot.click("#knob-volume-down")
+            app.settings_screen.query_one("#knob-volume-down").focus()
+            await pilot.press("enter")
             await pilot.pause()
 
             assert after_up > before
@@ -115,7 +123,7 @@ def test_chat_input_accepts_text_without_api_key(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_user_preset_slot_saves_current_patch(monkeypatch, tmp_path) -> None:
+def test_preset_save_flow_validates_cancels_and_saves(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     async def run() -> None:
@@ -126,17 +134,64 @@ def test_user_preset_slot_saves_current_patch(monkeypatch, tmp_path) -> None:
 
         async with app.run_test(size=(180, 60)) as pilot:
             app.synth_rack.apply_patch({"tone": 0.21, "release": 0.42}, emit=False)
-            await pilot.click("#user-preset-0")
+            await pilot.press("comma")
+            await pilot.pause()
+            assert app.screen is app.settings_screen
+            await pilot.click("#preset-save")
+            name_input = app.settings_screen.query_one("#preset-name-input")
+            name_input.value = "Init"
+            await pilot.click("#preset-save-confirm")
+            assert "cannot be overwritten" in str(
+                app.settings_screen.query_one("#preset-feedback").render()
+            )
+
+            name_input.value = "My Arp"
+            await pilot.click("#preset-save-cancel")
+            assert not app.settings_screen.query_one("#preset-save-flow").display
+
+            await pilot.click("#preset-save")
+            name_input.value = "My Arp"
+            await pilot.click("#preset-save-confirm")
             await pilot.pause()
 
-            assert store.presets["User 1"]["tone"] == 0.21
-            assert store.presets["User 1"]["release"] == 0.42
+            assert store.presets["My Arp"]["tone"] == 0.21
+            assert store.presets["My Arp"]["release"] == 0.42
             assert store.path.exists()
+            assert "My Arp" in str(app.settings_screen.query_one("#preset-loaded-state").render())
+            assert app.settings_screen.query_one("#user-preset-0")
 
             app.synth_rack.apply_patch({"tone": 0.8, "release": 0.1}, emit=False)
-            app.synth_tool_apply_preset("User 1")
+            await pilot.click("#user-preset-0")
+            assert app.synth_rack.selected_preset == "My Arp"
+            assert app.synth_patch.preset_name is None
+            await pilot.click("#preset-load")
 
             assert app.synth_patch.values["tone"] == 0.21
             assert app.synth_patch.values["release"] == 0.42
+
+    asyncio.run(run())
+
+
+def test_compact_reset_restores_init_patch(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    async def run() -> None:
+        app = HalcyonApp()
+        fake_audio = FakeAudio()
+        app.audio = fake_audio  # type: ignore[assignment]
+        app.midi = FakeMidi()  # type: ignore[assignment]
+
+        async with app.run_test(size=(90, 30)) as pilot:
+            app.synth_rack.apply_patch({"tone": 0.9}, emit=False)
+            await pilot.press("f2")
+            await pilot.pause()
+            assert app.screen is app.settings_screen
+            app.settings_screen.query_one("#synth-reset").focus()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.synth_patch.preset_name == "Init"
+            assert app.synth_patch.values["tone"] != 0.9
+            assert "cutoff_hz" in fake_audio.patches[-1]
 
     asyncio.run(run())
