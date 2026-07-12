@@ -1,116 +1,111 @@
-from types import SimpleNamespace
+import json
+from unittest.mock import MagicMock, patch
 
 from halcyon.assistant import DISABLED_MESSAGE, HalcyonAssistant, openai_tool_definitions
+from halcyon.chat_router import MISSING_KEY_REASON
+from halcyon.menu import load_menu
+
+_LLM = "halcyon.chat_router._call_router_llm"
 
 
-class FakeResponses:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def create(self, **kwargs):  # type: ignore[no-untyped-def]
-        self.calls.append(kwargs)
-        if len(self.calls) == 1:
-            return SimpleNamespace(
-                id="resp-1",
-                output=[
-                    {
-                        "type": "function_call",
-                        "name": "apply_synth_patch",
-                        "arguments": '{"values":{"tone":0.85,"release":0.03}}',
-                        "call_id": "call-1",
-                    }
-                ],
-                output_text="",
-            )
-        return SimpleNamespace(id="resp-2", output=[], output_text="Brighter and shorter.")
+def test_openai_tool_definitions_expose_no_raw_synth_tools() -> None:
+    assert openai_tool_definitions() == []
 
 
-class FakeClient:
-    def __init__(self) -> None:
-        self.responses = FakeResponses()
-
-
-def test_openai_tool_definitions_are_limited_to_synth_tools() -> None:
-    names = {tool["name"] for tool in openai_tool_definitions()}
-
-    assert names == {
-        "get_synth_state",
-        "list_synth_params",
-        "set_synth_param",
-        "apply_synth_patch",
-        "apply_synth_preset",
-        "save_synth_preset",
-        "all_notes_off",
+def test_assistant_returns_routing_decision_from_mocked_openai() -> None:
+    payload = {
+        "action": "menu",
+        "stages": [["/synth patch tone=0.85 release=0.05"]],
+        "reason": "brighter and shorter",
     }
-    assert all(tool["type"] == "function" for tool in openai_tool_definitions())
+    llm = MagicMock(return_value=json.dumps(payload))
+    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=object())
+
+    with patch(_LLM, llm):
+        result = assistant.ask("make it brighter and shorter")
+
+    assert result.text == "Routing to `/synth patch tone=0.85 release=0.05`."
+    assert result.decision.commands == ("/synth patch tone=0.85 release=0.05",)
+    assert result.tool_results == []
+    assert result.enabled
 
 
-def test_assistant_executes_tool_call_from_mocked_openai() -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
+def test_assistant_passes_live_context_to_router_prompt() -> None:
+    payload = {
+        "action": "menu",
+        "stages": [["/preset save Deep Time"]],
+        "reason": "save current patch",
+    }
+    llm = MagicMock(return_value=json.dumps(payload))
+    assistant = HalcyonAssistant(
+        menu_def=load_menu(),
+        api_key="sk-test",
+        client=object(),
+        context_provider=lambda: {
+            "patch": {"preset": None, "params": [{"id": "tone", "normalized": 0.22}]},
+            "presets": {"built_in": ["Init"], "user": []},
+        },
+    )
 
-    def executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
-        calls.append((name, arguments))
-        if name == "get_synth_state":
-            return {"patch": {"preset": "Init"}, "recent_midi": []}
-        return {"ok": True, "arguments": arguments}
+    with patch(_LLM, llm):
+        result = assistant.ask("save this preset as Deep Time")
 
-    client = FakeClient()
-    assistant = HalcyonAssistant(executor, api_key="sk-test", client=client)
+    prompt = llm.call_args.args[0]
+    assert '"normalized":0.22' in prompt
+    assert '"user":[]' in prompt
+    assert result.decision.commands == ("/preset save Deep Time",)
 
-    result = assistant.ask("make it brighter and shorter")
 
-    assert result.text == "Brighter and shorter."
-    assert calls == [
-        ("get_synth_state", {}),
-        ("apply_synth_patch", {"values": {"tone": 0.85, "release": 0.03}}),
-    ]
-    assert client.responses.calls[1]["previous_response_id"] == "resp-1"
+def test_assistant_passes_recent_chat_context_to_router_prompt() -> None:
+    llm = MagicMock(
+        side_effect=[
+            json.dumps(
+                {
+                    "action": "menu",
+                    "stages": [["/synth patch tone=0.34 release=0.58"]],
+                    "reason": "initial patch",
+                }
+            ),
+            json.dumps(
+                {
+                    "action": "menu",
+                    "stages": [["/synth set tone 0.22"]],
+                    "reason": "relative adjustment",
+                }
+            ),
+        ]
+    )
+    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=object())
+
+    with patch(_LLM, llm):
+        assistant.ask("make a Deep Time patch")
+        result = assistant.ask("make it darker")
+
+    second_prompt = llm.call_args_list[1].args[0]
+    assert "make a Deep Time patch" in second_prompt
+    assert "/synth patch tone=0.34 release=0.58" in second_prompt
+    assert result.decision.commands == ("/synth set tone 0.22",)
 
 
 def test_assistant_missing_key_is_deterministic(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    assistant = HalcyonAssistant(lambda name, arguments: {})
+    assistant = HalcyonAssistant(menu_def=load_menu())
 
-    result = assistant.ask("turn the tone up")
+    result = assistant.ask("do the subtle thing and also another subtle thing")
 
+    assert result.text == MISSING_KEY_REASON
     assert result.text == DISABLED_MESSAGE
+    assert result.decision.action == "reject"
     assert not result.enabled
 
 
-def test_assistant_surfaces_tool_errors() -> None:
-    class ErrorResponses:
-        def __init__(self) -> None:
-            self.calls = 0
+def test_assistant_natural_language_requires_openai_key(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assistant = HalcyonAssistant(menu_def=load_menu())
 
-        def create(self, **kwargs):  # type: ignore[no-untyped-def]
-            self.calls += 1
-            if self.calls == 1:
-                return SimpleNamespace(
-                    id="resp-1",
-                    output=[
-                        {
-                            "type": "function_call",
-                            "name": "set_synth_param",
-                            "arguments": '{"param":"tone","value":"bad"}',
-                            "call_id": "call-1",
-                        }
-                    ],
-                    output_text="",
-                )
-            return SimpleNamespace(id="resp-2", output=[], output_text="")
+    result = assistant.ask("all notes off")
 
-    def executor(name: str, arguments: dict[str, object]) -> dict[str, object]:
-        if name == "get_synth_state":
-            return {}
-        raise ValueError("value must be a number")
-
-    assistant = HalcyonAssistant(
-        executor,
-        api_key="sk-test",
-        client=SimpleNamespace(responses=ErrorResponses()),
-    )
-
-    result = assistant.ask("break it")
-
-    assert result.text == "Tool error: value must be a number"
+    assert result.text == MISSING_KEY_REASON
+    assert result.decision.action == "reject"
+    assert not result.enabled
