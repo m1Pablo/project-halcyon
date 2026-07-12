@@ -62,9 +62,41 @@ pub fn encode_frame(samples: &[f32]) -> Vec<u8> {
     frame
 }
 
+#[derive(Debug)]
+struct PendingFrame {
+    bytes: Vec<u8>,
+    written: usize,
+}
+
+impl PendingFrame {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, written: 0 }
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.written..]
+    }
+
+    fn advance(&mut self, count: usize) {
+        self.written = (self.written + count).min(self.bytes.len());
+    }
+
+    fn is_complete(&self) -> bool {
+        self.written >= self.bytes.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameSendResult {
+    Complete,
+    Pending,
+    Disconnect,
+}
+
 fn run_viz_thread(config: VizConfig, mut consumer: Consumer<f32>, running: Arc<AtomicBool>) {
     let mut window = RollingSampleWindow::new(config.sample_count);
     let mut stream: Option<UnixStream> = None;
+    let mut pending_frame: Option<PendingFrame> = None;
     let mut next_connect = Instant::now();
     let mut next_send = Instant::now();
     let frame_interval = config.frame_interval();
@@ -82,16 +114,17 @@ fn run_viz_thread(config: VizConfig, mut consumer: Consumer<f32>, running: Arc<A
 
         if now >= next_send {
             next_send = now + frame_interval;
-            if let Some(socket) = stream.as_mut() {
-                let frame = encode_frame(&window.snapshot());
-                let mut disconnect = false;
-                match socket.write(&frame) {
-                    Ok(written) if written == frame.len() => {}
-                    Ok(_) => disconnect = true,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(_) => disconnect = true,
-                }
-                if disconnect {
+            if stream.is_some() && pending_frame.is_none() {
+                pending_frame = Some(PendingFrame::new(encode_frame(&window.snapshot())));
+            }
+        }
+
+        if let (Some(socket), Some(frame)) = (stream.as_mut(), pending_frame.as_mut()) {
+            match flush_pending_frame(socket, frame) {
+                FrameSendResult::Complete => pending_frame = None,
+                FrameSendResult::Pending => {}
+                FrameSendResult::Disconnect => {
+                    pending_frame = None;
                     stream = None;
                 }
             }
@@ -99,6 +132,20 @@ fn run_viz_thread(config: VizConfig, mut consumer: Consumer<f32>, running: Arc<A
 
         thread::sleep(IDLE_SLEEP);
     }
+}
+
+fn flush_pending_frame<W: Write>(writer: &mut W, frame: &mut PendingFrame) -> FrameSendResult {
+    while !frame.is_complete() {
+        match writer.write(frame.remaining()) {
+            Ok(0) => return FrameSendResult::Disconnect,
+            Ok(written) => frame.advance(written),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return FrameSendResult::Pending;
+            }
+            Err(_) => return FrameSendResult::Disconnect,
+        }
+    }
+    FrameSendResult::Complete
 }
 
 fn connect_socket(socket_path: &str) -> Option<UnixStream> {
@@ -169,6 +216,7 @@ impl RollingSampleWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn frame_encoding_uses_magic_count_and_little_endian_f32() {
@@ -192,5 +240,87 @@ mod tests {
         window.push(4.0);
         window.push(5.0);
         assert_eq!(window.snapshot(), vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[derive(Debug)]
+    enum WriteAction {
+        Write(usize),
+        WouldBlock,
+        Error(io::ErrorKind),
+    }
+
+    #[derive(Debug)]
+    struct ScriptedWriter {
+        actions: VecDeque<WriteAction>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedWriter {
+        fn new(actions: impl IntoIterator<Item = WriteAction>) -> Self {
+            Self {
+                actions: actions.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            match self
+                .actions
+                .pop_front()
+                .unwrap_or(WriteAction::Write(buf.len()))
+            {
+                WriteAction::Write(count) => {
+                    let count = count.min(buf.len());
+                    self.written.extend_from_slice(&buf[..count]);
+                    Ok(count)
+                }
+                WriteAction::WouldBlock => Err(io::Error::new(io::ErrorKind::WouldBlock, "busy")),
+                WriteAction::Error(kind) => Err(io::Error::new(kind, "failed")),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pending_frame_retries_after_partial_write_and_would_block() {
+        let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut frame = PendingFrame::new(bytes.clone());
+        let mut writer = ScriptedWriter::new([
+            WriteAction::Write(3),
+            WriteAction::WouldBlock,
+            WriteAction::Write(5),
+        ]);
+
+        assert_eq!(
+            flush_pending_frame(&mut writer, &mut frame),
+            FrameSendResult::Pending
+        );
+        assert_eq!(frame.remaining(), &[4, 5, 6, 7, 8]);
+        assert_eq!(writer.written, vec![1, 2, 3]);
+
+        assert_eq!(
+            flush_pending_frame(&mut writer, &mut frame),
+            FrameSendResult::Complete
+        );
+        assert!(frame.is_complete());
+        assert_eq!(writer.written, bytes);
+    }
+
+    #[test]
+    fn pending_frame_disconnects_on_write_error() {
+        let mut frame = PendingFrame::new(vec![1, 2, 3, 4]);
+        let mut writer = ScriptedWriter::new([WriteAction::Error(io::ErrorKind::BrokenPipe)]);
+
+        assert_eq!(
+            flush_pending_frame(&mut writer, &mut frame),
+            FrameSendResult::Disconnect
+        );
+        assert_eq!(frame.remaining(), &[1, 2, 3, 4]);
+        assert!(writer.written.is_empty());
     }
 }
