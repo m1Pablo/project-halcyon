@@ -40,7 +40,7 @@ Personal logs are authoritative and the coordinator log is the coordination spin
 - Use and verify the repository `m1Pablo/project-halcyon`; prefer explicit `--repo m1Pablo/project-halcyon` arguments where supported.
 - If access to `m1Pablo/project-halcyon` fails, stop and surface the blocker. Do not create a replacement repository or change `origin` as an automatic fallback.
 - Envoy stages explicit owned files only. Never use `git add .` or `git add -A`.
-- Do not commit `.codex/plans/`, `.codex/ledger/`, `.codex/logs/`, `.env`, `.env.*`, synced third-party skill copies, editor settings, secrets, or generated caches.
+- Do not commit `.codex/plans/`, `.codex/ledger/`, `.codex/logs/`, `.env`, `.env.*`, synced third-party skill copies, editor settings, secrets, generated caches, or generated Atlas notes.
 - Draft PRs are the default shipping surface unless the user explicitly asks for a direct push-only flow or ready-for-review PR.
 
 ## Product Direction
