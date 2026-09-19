@@ -13,9 +13,17 @@ def test_build_slash_tree_uses_menu_definition_only() -> None:
 
     tree = build_slash_tree(menu_def)
 
-    assert set(tree) == {"synth", "preset", "panic"}
+    assert set(tree) == {"synth", "preset", "coach", "panic"}
     assert set(tree["synth"].children) == {"state", "params", "set", "patch"}
     assert tree["panic"].payload["tool"] == "all_notes_off"
+    assert set(tree["coach"].children) == {
+        "teach",
+        "replay",
+        "attempt",
+        "feedback",
+        "state",
+        "stop",
+    }
 
 
 def test_resolve_leaf_command_with_arguments() -> None:
@@ -33,6 +41,24 @@ def test_resolve_quoted_arguments_for_preset_names() -> None:
     assert resolved.status == "leaf"
     assert resolved.leaf_command == "/preset apply"
     assert resolved.arguments == ("Soft Pad",)
+
+
+def test_resolve_coach_arguments_preserves_original_case() -> None:
+    resolved = resolve_slash_command(
+        load_menu(),
+        '/coach teach "Aphex Twin Avril 14th" --segment "Main Melody" --author bounded',
+    )
+
+    assert resolved.status == "leaf"
+    assert resolved.leaf_command == "/coach teach"
+    assert resolved.payload["tool"] == "start_coach_lesson"
+    assert resolved.arguments == (
+        "Aphex Twin Avril 14th",
+        "--segment",
+        "Main Melody",
+        "--author",
+        "bounded",
+    )
 
 
 def test_resolve_group_lists_children_without_payload() -> None:
@@ -94,5 +120,11 @@ def test_leaf_iteration_is_command_listing_source() -> None:
         "/synth patch",
         "/preset apply",
         "/preset save",
+        "/coach teach",
+        "/coach replay",
+        "/coach attempt",
+        "/coach feedback",
+        "/coach state",
+        "/coach stop",
         "/panic",
     ]

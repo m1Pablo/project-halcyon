@@ -27,9 +27,16 @@ BLACK_IDLE_STYLE = "#fcfcfa on #090b10"
 WHITE_IDLE_STYLE = "#090b10 on #fcfcfa"
 BLACK_PRESSED_STYLE = "bold #090b10 on #ff9f43"
 WHITE_PRESSED_STYLE = "bold #090b10 on #ff9f43"
+BLACK_HALCYON_STYLE = "bold #090b10 on #ab9df2"
+WHITE_HALCYON_STYLE = "bold #090b10 on #ab9df2"
 BLACK_TARGET_STYLE = "bold #090b10 on #78dce8"
 WHITE_TARGET_STYLE = "bold #090b10 on #78dce8"
 COMBINED_STATE_STYLE = "bold #090b10 on #ffd866"
+HUMAN_MARKER_STYLE = "bold #ff9f43 on #11151d"
+HALCYON_MARKER_STYLE = "bold #ab9df2 on #11151d"
+BOTH_MARKER_STYLE = "bold #ffd866 on #11151d"
+TARGET_MARKER_STYLE = "bold #78dce8 on #11151d"
+LEGEND_TEXT = "● YOU   ◆ HALCYON   ●◆ BOTH   ○ NEXT"
 
 
 @dataclass(frozen=True)
@@ -167,20 +174,47 @@ def key_style(
     note: int,
     pressed_notes: set[int] | frozenset[int],
     target_notes: set[int] | frozenset[int] = frozenset(),
+    *,
+    halcyon_notes: set[int] | frozenset[int] = frozenset(),
 ) -> str:
     """Return the render style for a note state."""
 
     is_black = is_black_note(note)
-    is_pressed = note in pressed_notes
+    is_human = note in pressed_notes
+    is_halcyon = note in halcyon_notes
     is_target = note in target_notes
 
-    if is_pressed and is_target:
+    if is_human and is_halcyon:
         return COMBINED_STATE_STYLE
-    if is_pressed:
+    if is_human:
         return BLACK_PRESSED_STYLE if is_black else WHITE_PRESSED_STYLE
+    if is_halcyon:
+        return BLACK_HALCYON_STYLE if is_black else WHITE_HALCYON_STYLE
     if is_target:
         return BLACK_TARGET_STYLE if is_black else WHITE_TARGET_STYLE
     return BLACK_IDLE_STYLE if is_black else WHITE_IDLE_STYLE
+
+
+def key_markers(
+    note: int,
+    human_notes: set[int] | frozenset[int],
+    halcyon_notes: set[int] | frozenset[int],
+    target_notes: set[int] | frozenset[int],
+) -> tuple[tuple[str, str], ...]:
+    """Return independent source and target markers for one key."""
+
+    human = note in human_notes
+    halcyon = note in halcyon_notes
+    markers: list[tuple[str, str]] = []
+    if human and halcyon:
+        markers.append(("●◆", BOTH_MARKER_STYLE))
+    elif human:
+        markers.append(("●", HUMAN_MARKER_STYLE))
+    elif halcyon:
+        markers.append(("◆", HALCYON_MARKER_STYLE))
+    if note in target_notes:
+        markers.append(("○", TARGET_MARKER_STYLE))
+    return tuple(markers)
 
 
 def _styled_row(
@@ -252,17 +286,43 @@ def _draw_frame(grid: list[list[tuple[str, str]]], *, width: int) -> None:
     _set_cell(grid[KEYBOARD_HEIGHT - 1], index=width - 1, char="┘", style=FRAME_STYLE)
 
 
+def _draw_legend(grid: list[list[tuple[str, str]]], *, width: int) -> None:
+    legend_left = max(2, (width - len(LEGEND_TEXT)) // 2)
+    legend_parts = (
+        ("● YOU", HUMAN_MARKER_STYLE),
+        ("   ◆ HALCYON", HALCYON_MARKER_STYLE),
+        ("   ●◆ BOTH", BOTH_MARKER_STYLE),
+        ("   ○ NEXT", TARGET_MARKER_STYLE),
+    )
+    offset = 0
+    for label, style in legend_parts:
+        for char in label:
+            _set_cell(
+                grid[0],
+                index=legend_left + offset,
+                char=char,
+                style=style,
+            )
+            offset += 1
+
+
 def _draw_white_keys(
     grid: list[list[tuple[str, str]]],
     *,
     keys: tuple[KeyboardKey, ...],
     pressed_notes: set[int] | frozenset[int],
+    halcyon_notes: set[int] | frozenset[int],
     target_notes: set[int] | frozenset[int],
 ) -> None:
     white_keys = [key for key in keys if not key.is_black]
     for key in white_keys:
         left = key.left + 1
-        style = key_style(key.note, pressed_notes, target_notes)
+        style = key_style(
+            key.note,
+            pressed_notes,
+            target_notes,
+            halcyon_notes=halcyon_notes,
+        )
         for row_index in range(1, KEYBOARD_HEIGHT - 1):
             _fill_span(
                 grid[row_index],
@@ -278,6 +338,26 @@ def _draw_white_keys(
             label=key.name,
             style=style,
         )
+        markers = key_markers(key.note, pressed_notes, halcyon_notes, target_notes)
+        if markers:
+            source_marker = markers[0] if markers[0][0] != "○" else None
+            target_marker = next((marker for marker in markers if marker[0] == "○"), None)
+            if source_marker is not None:
+                _write_label(
+                    grid[5],
+                    left=left,
+                    width=key.width,
+                    label=source_marker[0],
+                    style=source_marker[1],
+                )
+            if target_marker is not None:
+                _write_label(
+                    grid[6],
+                    left=left,
+                    width=key.width,
+                    label=target_marker[0],
+                    style=target_marker[1],
+                )
 
     for boundary_index in range(1, len(white_keys)):
         boundary = boundary_index * WHITE_KEY_WIDTH + 1
@@ -297,6 +377,7 @@ def _draw_black_keys(
     *,
     keys: tuple[KeyboardKey, ...],
     pressed_notes: set[int] | frozenset[int],
+    halcyon_notes: set[int] | frozenset[int],
     target_notes: set[int] | frozenset[int],
 ) -> None:
     for key in keys:
@@ -304,11 +385,31 @@ def _draw_black_keys(
             continue
 
         left = key.left + 1
-        style = key_style(key.note, pressed_notes, target_notes)
+        style = key_style(
+            key.note,
+            pressed_notes,
+            target_notes,
+            halcyon_notes=halcyon_notes,
+        )
         _write_label(grid[1], left=left, width=key.width, label="┌───┐", style=style)
-        _write_label(grid[2], left=left, width=key.width, label="│   │", style=style)
+        markers = key_markers(key.note, pressed_notes, halcyon_notes, target_notes)
+        source_marker = next((marker for marker in markers if marker[0] != "○"), None)
+        target_marker = next((marker for marker in markers if marker[0] == "○"), None)
+        _write_label(
+            grid[2],
+            left=left,
+            width=key.width,
+            label=f"│{source_marker[0] if source_marker else ' '}│",
+            style=source_marker[1] if source_marker else style,
+        )
         _write_label(grid[3], left=left, width=key.width, label=key.name, style=style)
-        _write_label(grid[4], left=left, width=key.width, label="│   │", style=style)
+        _write_label(
+            grid[4],
+            left=left,
+            width=key.width,
+            label=f"│{target_marker[0] if target_marker else ' '}│",
+            style=target_marker[1] if target_marker else style,
+        )
         _write_label(grid[5], left=left, width=key.width, label="└─┬─┘", style=style)
 
 
@@ -316,6 +417,7 @@ def keyboard_text(
     pressed_notes: set[int] | frozenset[int],
     target_notes: set[int] | frozenset[int] = frozenset(),
     *,
+    halcyon_notes: set[int] | frozenset[int] = frozenset(),
     keys: tuple[KeyboardKey, ...] | None = None,
 ) -> Text:
     """Render a fixed-width MIDI piano surface as rich text."""
@@ -328,14 +430,17 @@ def keyboard_text(
         grid,
         keys=key_set,
         pressed_notes=pressed_notes,
+        halcyon_notes=halcyon_notes,
         target_notes=target_notes,
     )
     _draw_black_keys(
         grid,
         keys=key_set,
         pressed_notes=pressed_notes,
+        halcyon_notes=halcyon_notes,
         target_notes=target_notes,
     )
+    _draw_legend(grid, width=width)
 
     text = Text()
     for row_index, row in enumerate(grid):

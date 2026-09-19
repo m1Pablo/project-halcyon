@@ -1,5 +1,9 @@
 from halcyon.keyboard import (
+    BLACK_HALCYON_STYLE,
     BLACK_TARGET_STYLE,
+    COMBINED_STATE_STYLE,
+    HALCYON_MARKER_STYLE,
+    HUMAN_MARKER_STYLE,
     KEYBOARD_HEIGHT,
     MIDI_END_NOTE,
     MIDI_KEY_COUNT,
@@ -11,6 +15,7 @@ from halcyon.keyboard import (
     WHITE_KEY_WIDTH,
     key_bounds,
     key_left,
+    key_markers,
     key_style,
     keyboard_keys,
     keyboard_inner_width,
@@ -141,3 +146,33 @@ def test_target_key_style_is_distinct() -> None:
     target_style = key_style(61, set(), {61})
 
     assert target_style == BLACK_TARGET_STYLE
+
+
+def test_human_halcyon_and_both_key_states_are_distinct() -> None:
+    human_style = key_style(61, {61})
+    halcyon_style = key_style(61, set(), halcyon_notes={61})
+    both_style = key_style(61, {61}, halcyon_notes={61})
+
+    assert human_style != halcyon_style
+    assert halcyon_style == BLACK_HALCYON_STYLE
+    assert both_style == COMBINED_STATE_STYLE
+
+
+def test_key_markers_preserve_both_sources_and_independent_target() -> None:
+    markers = key_markers(60, {60}, {60}, {60})
+
+    assert [marker for marker, _style in markers] == ["●◆", "○"]
+
+
+def test_keyboard_renders_accessible_legend_and_source_markers() -> None:
+    rendered = keyboard_text({60}, {60}, halcyon_notes={60, 61})
+    compact_rows = rendered.plain.splitlines()[:7]
+
+    assert "● YOU   ◆ HALCYON   ●◆ BOTH   ○ NEXT" in rendered.plain
+    assert "●◆" in rendered.plain
+    assert "○" in rendered.plain
+    assert any("●◆" in row for row in compact_rows[1:])
+    assert any("○" in row for row in compact_rows[1:])
+    styles = {str(span.style) for span in rendered.spans}
+    assert HUMAN_MARKER_STYLE in styles
+    assert HALCYON_MARKER_STYLE in styles

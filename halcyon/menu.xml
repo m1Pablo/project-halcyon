@@ -4,7 +4,7 @@
             name="State"
             shortcut="state"
             tool="get_synth_state"
-            description="Show current synth patch, audio status, pressed notes, and recent MIDI events"
+            description="Show current synth patch, audio status, and aggregate pressed-note state"
         />
         <suboption
             name="Params"
@@ -48,6 +48,64 @@
             usage="/preset save &lt;name&gt;"
             description="Save the current synth patch as a user preset"
             mcp_concurrency_group="synth_patch"
+            mcp_poll_after_s="1"
+        />
+    </option>
+    <option name="Coach" shortcut="coach" description="Learn, replay, attempt, and review saved MIDI lessons">
+        <suboption
+            name="Teach"
+            shortcut="teach"
+            tool="start_coach_lesson"
+            usage="/coach teach QUERY [--segment LABEL --tempo 25..200 --difficulty foundation|standard|challenge --hand left|right|both --loops 1..8 --author never|bounded]"
+            description="Reuse a saved lesson or author one local bounded approximation for a named segment, then demonstrate, capture, and score it; --author never is cache-only"
+            mcp_concurrency_group="coach_session"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Replay"
+            shortcut="replay"
+            tool="replay_coach_lesson"
+            usage="/coach replay [--segment LABEL --tempo 25..200 --loops 1..8]"
+            description="Replay the active saved lesson without authoring or overwriting it"
+            mcp_concurrency_group="coach_session"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Attempt"
+            shortcut="attempt"
+            tool="start_coach_attempt"
+            usage="/coach attempt [--segment LABEL --tempo 25..200 --count-in 0..8]"
+            description="Capture and score a fresh human-only attempt against the active lesson"
+            mcp_concurrency_group="coach_session"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Feedback"
+            shortcut="feedback"
+            tool="get_coach_feedback"
+            usage="/coach feedback [attempt_id]"
+            description="End an active capture early or retrieve one bounded deterministic report"
+            mcp_concurrency_group="coach_session"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="State"
+            shortcut="state"
+            tool="get_coach_state"
+            usage="/coach state"
+            description="Read the bounded coach phase, lesson settings, progress, and latest aggregate report"
+            mcp_single_flight="false"
+            mcp_parallel_ok="true"
+            mcp_poll_after_s="1"
+        />
+        <suboption
+            name="Stop"
+            shortcut="stop"
+            tool="stop_coach_session"
+            usage="/coach stop"
+            description="Cancel coach work and release only Halcyon-owned voices for its session"
+            mcp_single_flight="false"
+            mcp_parallel_ok="true"
             mcp_poll_after_s="1"
         />
     </option>

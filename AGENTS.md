@@ -74,8 +74,9 @@ Until the repo has a full test harness, run the narrowest available `uv run ...`
 - Rust sends waveform visualization samples over a separate Unix domain socket configured by `HALCYON_VIZ_SOCKET`; do not add sample payloads to the JSON control protocol.
 - Visualization frames are raw `HZV1` + little-endian `u32` count + little-endian `f32` samples. Keep sending best-effort and off the audio thread.
 - Keep audio callback code realtime-safe: no blocking calls, logging, heap allocation, or locks in the CPAL callback.
-- Keep OpenAI usage environment-only. Do not read `.env`, print API keys, or use live OpenAI calls in automated tests.
+- Accept OpenAI keys only from `OPENAI_API_KEY` or the app's attested native OS credential vault. Environment values take precedence; never read `.env`, use a plaintext fallback, print API keys, expose them through MCP/app state or the Rust audio-sidecar environment, or make live OpenAI calls in automated tests.
 - Local MCP control must bind to `127.0.0.1` and expose only command-control tools. Do not re-advertise raw synth tools through the public HTTP or stdio MCP surfaces.
+- Standard MIDI file import must remain an explicit bounded local CLI operation: regular format-0/1 `.mid`/`.midi` files only, no private paths in persisted/public data, and no file-import surface in chat, HTTP, `menu.xml`, or MCP.
 - New chat or MCP actions must be added first to `halcyon/menu.xml`; update the command executor/router tests so slash autocomplete, LLM routing, and MCP command listing stay derived from the same registry.
 - Preset persistence must keep built-in presets read-only and write user presets outside the repo unless a test explicitly overrides `HALCYON_PRESETS_PATH`.
 - Textual CSS is not web CSS. Verify with the Textual app, not browser assumptions.

@@ -14,6 +14,7 @@ Footer { height: 1; background: $surface; color: $halcyon-muted; }
 #scope-toolbar Button.selected, #compact-nav Button.selected { color: $halcyon-active; text-style: bold; background: $boost; }
 #oscillator-scope { height: 1fr; min-height: 7; color: $halcyon-viz; background: $surface; }
 #keyboard-title { height: 2; padding-left: 1; color: $halcyon-midi; border-top: solid $halcyon-line; }
+#keyboard-legend { height: 1; padding-left: 1; color: $halcyon-muted; background: $surface; }
 #keyboard-scroll { width: 100%; height: 12; background: $surface; overflow-x: auto; overflow-y: hidden; }
 #keyboard { width: 527; height: 11; padding: 0; background: $surface; }
 #activity-panel { width: 48; min-width: 31; height: 100%; padding: 0 1; }
@@ -29,6 +30,16 @@ SoundSettingsScreen { background: $background 58%; }
 .settings-section-title { height: 3; margin-top: 1; color: $halcyon-active; text-style: bold; content-align: left middle; border-bottom: solid $halcyon-line; }
 .settings-subtitle { height: 2; color: $halcyon-midi; text-style: bold; }
 .settings-help { height: auto; min-height: 1; color: $halcyon-muted; }
+#openai-credential-status { height: auto; min-height: 3; margin-top: 1; padding: 1; color: $halcyon-muted; background: $surface; border-left: thick $halcyon-line; }
+#openai-credential-status.configured { color: $success; border-left: thick $success; }
+#openai-credential-status.busy { color: $halcyon-target; border-left: thick $halcyon-target; }
+#openai-credential-status.error { color: $error; border-left: thick $error; }
+#openai-key-input { width: 1fr; height: 4; }
+#openai-credential-actions { width: 100%; height: 4; margin-top: 1; }
+#openai-credential-actions Button { width: 17; min-width: 14; height: 4; }
+#openai-credential-feedback { height: 2; color: $success; }
+#openai-credential-feedback.error { color: $error; }
+#openai-credential-help { margin-bottom: 1; }
 #preset-loaded-state { height: 3; padding: 1; color: $halcyon-midi; text-style: bold; }
 #preset-help { height: 2; color: $halcyon-muted; }
 #preset-list { height: auto; }
@@ -52,7 +63,7 @@ SynthKnob:focus { border: tall $halcyon-active; background: $boost; }
 .knob-step { width: 5; min-width: 5; height: 5; border: none; background: $boost; color: $foreground; }
 .knob-meter { width: 1fr; height: 5; content-align: center middle; background: $panel; color: $halcyon-active; }
 
-#command-console { height: 12; min-height: 8; margin-top: 1; padding: 0 1; }
+#command-console { height: 18; min-height: 13; margin-top: 1; padding: 0 1; }
 #chat-panel { height: 1fr; background: $surface; }
 #chat-log { height: 1fr; padding: 0 1; background: $surface; }
 #chat-slash-hint { height: 1; padding: 0 1; color: $halcyon-target; background: $surface; }
@@ -65,9 +76,10 @@ SynthKnob:focus { border: tall $halcyon-active; background: $boost; }
 
 Screen.-medium #performance-stage { width: 1fr; }
 Screen.-medium #activity-panel { width: 32; min-width: 28; }
-Screen.-medium #command-console { height: 9; }
+Screen.-medium #command-console { height: 13; }
 Screen.-medium #keyboard-scroll { height: 9; }
 Screen.-medium #keyboard { height: 8; }
+Screen.-medium #keyboard-legend { height: 1; }
 SoundSettingsScreen.-medium #settings-drawer { width: 68; }
 
 Screen.-compact Footer { display: none; }
@@ -82,11 +94,13 @@ Screen.-compact #app-shell.workspace-console #main-workspace { display: none; }
 Screen.-compact #app-shell.workspace-console #command-console { display: block; width: 100%; height: 100%; min-height: 0; margin: 0; }
 Screen.-compact #keyboard-scroll { height: 8; }
 Screen.-compact #keyboard { height: 7; }
+Screen.-compact #keyboard-legend { height: 1; }
 Screen.-compact #command-console .panel-title { display: none; }
 Screen.-compact #chat-input-row, Screen.-compact #chat-input { height: 5; }
 SoundSettingsScreen.-compact #settings-drawer { width: 100%; border-left: none; }
 SoundSettingsScreen.-compact #settings-header { height: 5; padding: 0 1; }
 SoundSettingsScreen.-compact #settings-heading .settings-help { display: none; }
 SoundSettingsScreen.-compact #settings-scroll { padding: 0 1 1 1; }
+SoundSettingsScreen.-compact #openai-credential-actions Button { width: 15; min-width: 12; }
 SoundSettingsScreen.-compact SynthKnob { height: 10; layout: grid; grid-size: 2 2; grid-columns: 1fr 12; grid-rows: 4 5; }
 SoundSettingsScreen.-compact .knob-adjust-row { width: 100%; column-span: 2; }

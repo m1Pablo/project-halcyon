@@ -12,18 +12,110 @@ pub enum SynthCommand {
         velocity: u8,
         #[serde(default = "default_channel")]
         channel: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<u64>,
     },
     NoteOff {
         note: u8,
         #[serde(default = "default_channel")]
         channel: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_id: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<u64>,
     },
-    AllNotesOff,
+    AllNotesOff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<u64>,
+    },
     SetParam {
         name: String,
         value: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<u64>,
     },
-    Shutdown,
+    Shutdown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_id: Option<u64>,
+    },
+}
+
+impl SynthCommand {
+    pub fn command_id(&self) -> Option<u64> {
+        match self {
+            Self::NoteOn { command_id, .. }
+            | Self::NoteOff { command_id, .. }
+            | Self::AllNotesOff { command_id }
+            | Self::SetParam { command_id, .. }
+            | Self::Shutdown { command_id } => *command_id,
+        }
+    }
+
+    pub fn is_safety(&self) -> bool {
+        matches!(
+            self,
+            Self::NoteOn { velocity: 0, .. }
+                | Self::NoteOff { .. }
+                | Self::AllNotesOff { .. }
+                | Self::Shutdown { .. }
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::NoteOn {
+                note,
+                velocity,
+                channel,
+                voice_id,
+                ..
+            } => {
+                validate_midi_note(*note)?;
+                if *velocity > 127 {
+                    return Err("MIDI velocity must be in 0..=127");
+                }
+                validate_midi_channel(*channel)?;
+                validate_voice_id(*voice_id)
+            }
+            Self::NoteOff {
+                note,
+                channel,
+                voice_id,
+                ..
+            } => {
+                validate_midi_note(*note)?;
+                validate_midi_channel(*channel)?;
+                validate_voice_id(*voice_id)
+            }
+            Self::AllNotesOff { .. } | Self::SetParam { .. } | Self::Shutdown { .. } => Ok(()),
+        }
+    }
+}
+
+fn validate_midi_note(note: u8) -> Result<(), &'static str> {
+    if note <= 127 {
+        Ok(())
+    } else {
+        Err("MIDI note must be in 0..=127")
+    }
+}
+
+fn validate_midi_channel(channel: u8) -> Result<(), &'static str> {
+    if (1..=16).contains(&channel) {
+        Ok(())
+    } else {
+        Err("MIDI channel must be in 1..=16")
+    }
+}
+
+fn validate_voice_id(voice_id: Option<u64>) -> Result<(), &'static str> {
+    if voice_id == Some(0) {
+        Err("voice_id must be nonzero when present")
+    } else {
+        Ok(())
+    }
 }
 
 fn default_channel() -> u8 {
@@ -167,6 +259,7 @@ impl Envelope {
 struct Voice {
     note: u8,
     channel: u8,
+    voice_id: Option<u64>,
     frequency_hz: f32,
     velocity_gain: f32,
     phase: f32,
@@ -175,10 +268,11 @@ struct Voice {
 }
 
 impl Voice {
-    fn new(note: u8, velocity: u8, channel: u8) -> Self {
+    fn new(note: u8, velocity: u8, channel: u8, voice_id: Option<u64>) -> Self {
         Self {
             note,
             channel,
+            voice_id,
             frequency_hz: midi_note_to_hz(note),
             velocity_gain: f32::from(velocity.clamp(1, 127)) / 127.0,
             phase: 0.0,
@@ -249,27 +343,34 @@ impl SynthEngine {
                 note,
                 velocity,
                 channel,
+                voice_id,
+                ..
             } => {
                 if velocity == 0 {
-                    self.release_note(note, channel);
+                    self.release_note(note, channel, voice_id);
                 } else {
-                    self.start_note(note, velocity, channel);
+                    self.start_note(note, velocity, channel, voice_id);
                 }
                 false
             }
-            SynthCommand::NoteOff { note, channel } => {
-                self.release_note(note, channel);
+            SynthCommand::NoteOff {
+                note,
+                channel,
+                voice_id,
+                ..
+            } => {
+                self.release_note(note, channel, voice_id);
                 false
             }
-            SynthCommand::AllNotesOff => {
+            SynthCommand::AllNotesOff { .. } => {
                 self.release_all();
                 false
             }
-            SynthCommand::SetParam { name, value } => {
+            SynthCommand::SetParam { name, value, .. } => {
                 self.params.set(&name, value);
                 false
             }
-            SynthCommand::Shutdown => {
+            SynthCommand::Shutdown { .. } => {
                 self.voices.clear();
                 true
             }
@@ -304,18 +405,26 @@ impl SynthEngine {
         output
     }
 
-    fn start_note(&mut self, note: u8, velocity: u8, channel: u8) {
+    fn start_note(&mut self, note: u8, velocity: u8, channel: u8, voice_id: Option<u64>) {
+        if voice_id.is_some() && self.voices.iter().any(|voice| voice.voice_id == voice_id) {
+            return;
+        }
         self.voices
             .retain(|voice| !(voice.note == note && voice.channel == channel && voice.is_done()));
         if self.voices.len() >= self.polyphony {
             self.voices.remove(0);
         }
-        self.voices.push(Voice::new(note, velocity, channel));
+        self.voices
+            .push(Voice::new(note, velocity, channel, voice_id));
     }
 
-    fn release_note(&mut self, note: u8, channel: u8) {
+    fn release_note(&mut self, note: u8, channel: u8, voice_id: Option<u64>) {
         for voice in &mut self.voices {
-            if voice.note == note && voice.channel == channel {
+            let identity_matches = match voice_id {
+                Some(expected) => voice.voice_id == Some(expected),
+                None => true,
+            };
+            if identity_matches && voice.note == note && voice.channel == channel {
                 voice.release(self.params.release_seconds, self.sample_rate);
             }
         }
@@ -364,13 +473,94 @@ mod tests {
             SynthCommand::NoteOn {
                 note: 60,
                 velocity: 96,
-                channel: 1
+                channel: 1,
+                voice_id: None,
+                command_id: None,
             }
         );
         assert_eq!(
             serde_json::to_string(&command).expect("serialized"),
             r#"{"type":"note_on","note":60,"velocity":96,"channel":1}"#
         );
+    }
+
+    #[test]
+    fn command_validation_accepts_midi_boundaries_and_legacy_voice_identity() {
+        let lower = SynthCommand::NoteOn {
+            note: 0,
+            velocity: 0,
+            channel: 1,
+            voice_id: None,
+            command_id: None,
+        };
+        let upper = SynthCommand::NoteOn {
+            note: 127,
+            velocity: 127,
+            channel: 16,
+            voice_id: Some(1),
+            command_id: Some(9),
+        };
+
+        assert_eq!(lower.validate(), Ok(()));
+        assert_eq!(upper.validate(), Ok(()));
+    }
+
+    #[test]
+    fn command_validation_rejects_invalid_midi_and_zero_voice_boundaries() {
+        let invalid = [
+            (
+                SynthCommand::NoteOn {
+                    note: 128,
+                    velocity: 100,
+                    channel: 1,
+                    voice_id: Some(1),
+                    command_id: None,
+                },
+                "MIDI note must be in 0..=127",
+            ),
+            (
+                SynthCommand::NoteOn {
+                    note: 60,
+                    velocity: 128,
+                    channel: 1,
+                    voice_id: Some(1),
+                    command_id: None,
+                },
+                "MIDI velocity must be in 0..=127",
+            ),
+            (
+                SynthCommand::NoteOff {
+                    note: 60,
+                    channel: 0,
+                    voice_id: Some(1),
+                    command_id: None,
+                },
+                "MIDI channel must be in 1..=16",
+            ),
+            (
+                SynthCommand::NoteOff {
+                    note: 60,
+                    channel: 17,
+                    voice_id: Some(1),
+                    command_id: None,
+                },
+                "MIDI channel must be in 1..=16",
+            ),
+            (
+                SynthCommand::NoteOn {
+                    note: 60,
+                    velocity: 100,
+                    channel: 1,
+                    voice_id: Some(0),
+                    command_id: None,
+                },
+                "voice_id must be nonzero when present",
+            ),
+        ];
+
+        for (command, expected) in invalid {
+            assert_eq!(command.validate(), Err(expected));
+        }
     }
 
     #[test]
@@ -386,6 +576,8 @@ mod tests {
             note: 69,
             velocity: 110,
             channel: 1,
+            voice_id: None,
+            command_id: None,
         });
 
         let samples = engine.render_offline(0.1);
@@ -401,17 +593,22 @@ mod tests {
         engine.handle_command(SynthCommand::SetParam {
             name: "release_seconds".to_owned(),
             value: 0.08,
+            command_id: None,
         });
         engine.handle_command(SynthCommand::NoteOn {
             note: 60,
             velocity: 120,
             channel: 1,
+            voice_id: None,
+            command_id: None,
         });
 
         let held = engine.render_offline(0.04);
         engine.handle_command(SynthCommand::NoteOff {
             note: 60,
             channel: 1,
+            voice_id: None,
+            command_id: None,
         });
         let released = engine.render_offline(0.2);
 
@@ -428,6 +625,8 @@ mod tests {
                 note,
                 velocity: 96,
                 channel: 1,
+                voice_id: None,
+                command_id: None,
             });
         }
 
@@ -440,6 +639,7 @@ mod tests {
         engine.handle_command(SynthCommand::SetParam {
             name: "drive".to_owned(),
             value: 99.0,
+            command_id: None,
         });
         assert_eq!(engine.params().drive, 8.0);
 
@@ -447,6 +647,8 @@ mod tests {
             note: 64,
             velocity: 127,
             channel: 1,
+            voice_id: None,
+            command_id: None,
         });
         let samples = engine.render_offline(0.1);
 
@@ -463,6 +665,8 @@ mod tests {
             note: 60,
             velocity: 120,
             channel: 1,
+            voice_id: None,
+            command_id: None,
         });
         let single_samples = single.render_offline(0.2);
 
@@ -472,11 +676,99 @@ mod tests {
                 note,
                 velocity: 120,
                 channel: 1,
+                voice_id: None,
+                command_id: None,
             });
         }
         let chord_samples = chord.render_offline(0.2);
 
         assert!(rms(&single_samples) > 0.001);
         assert!(rms(&chord_samples) < rms(&single_samples) * 2.2);
+    }
+
+    #[test]
+    fn command_schema_round_trips_optional_voice_and_command_ids() {
+        let json = r#"{"type":"note_off","note":60,"channel":1,"voice_id":91,"command_id":7}"#;
+        let command: SynthCommand = serde_json::from_str(json).expect("valid command");
+
+        assert_eq!(command.command_id(), Some(7));
+        assert!(command.is_safety());
+        assert_eq!(serde_json::to_string(&command).expect("serialized"), json);
+    }
+
+    #[test]
+    fn velocity_zero_note_on_uses_safety_admission_classification() {
+        let command: SynthCommand = serde_json::from_str(
+            r#"{"type":"note_on","note":60,"velocity":0,"channel":1,"voice_id":91}"#,
+        )
+        .expect("valid command");
+
+        assert!(command.is_safety());
+    }
+
+    #[test]
+    fn voice_ids_release_same_note_instances_independently() {
+        let mut engine = SynthEngine::new(48_000.0);
+        engine.handle_command(SynthCommand::SetParam {
+            name: "release_seconds".to_owned(),
+            value: 0.0,
+            command_id: None,
+        });
+        for voice_id in [100, 200] {
+            engine.handle_command(SynthCommand::NoteOn {
+                note: 60,
+                velocity: 100,
+                channel: 1,
+                voice_id: Some(voice_id),
+                command_id: None,
+            });
+        }
+        assert_eq!(engine.active_voice_count(), 2);
+
+        engine.handle_command(SynthCommand::NoteOff {
+            note: 60,
+            channel: 1,
+            voice_id: Some(100),
+            command_id: None,
+        });
+        engine.render_sample();
+        assert_eq!(engine.active_voice_count(), 1);
+
+        engine.handle_command(SynthCommand::NoteOff {
+            note: 60,
+            channel: 1,
+            voice_id: Some(999),
+            command_id: None,
+        });
+        engine.render_sample();
+        assert_eq!(engine.active_voice_count(), 1);
+    }
+
+    #[test]
+    fn absent_voice_id_keeps_legacy_note_channel_release() {
+        let mut engine = SynthEngine::new(48_000.0);
+        engine.handle_command(SynthCommand::SetParam {
+            name: "release_seconds".to_owned(),
+            value: 0.0,
+            command_id: None,
+        });
+        for voice_id in [Some(10), Some(20)] {
+            engine.handle_command(SynthCommand::NoteOn {
+                note: 62,
+                velocity: 100,
+                channel: 1,
+                voice_id,
+                command_id: None,
+            });
+        }
+
+        engine.handle_command(SynthCommand::NoteOff {
+            note: 62,
+            channel: 1,
+            voice_id: None,
+            command_id: None,
+        });
+        engine.render_sample();
+        assert_eq!(engine.active_voice_count(), 0);
     }
 }
