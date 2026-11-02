@@ -163,6 +163,69 @@ def test_missing_key_is_visible_in_terminal_verdict(monkeypatch):
     assert result["verdict"]["needs_attention"]
 
 
+def test_model_diagnostics_reach_tracked_result_and_display():
+    import httpx
+    from openai import BadRequestError
+
+    client = MagicMock()
+    client.responses.create.side_effect = BadRequestError(
+        "private provider message",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            headers={"x-request-id": "req_test"},
+        ),
+        body={"code": "unsupported_parameter", "param": "input"},
+    )
+    svc = service(HalcyonAssistant(client=client, model="configured-model"))
+    svc._display = MagicMock()
+    result = finish(svc, svc.start("teach me"))
+    assert result["status"] == "failed"
+    assert result["result"]["diagnostic"]["request_id"] == "req_test"
+    assert result["result"]["diagnostic"]["model"] == "configured-model"
+    assert "req_test" in str(svc._display.call_args_list)
+    assert "private provider message" not in str(result)
+    assert result["verdict"]["needs_attention"]
+    svc._command.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        ("credit_balance_exhausted", "model_credit_balance_exhausted"),
+        ("rate_limit_exceeded", "model_rate_limited"),
+        ("slow_down", "model_rate_limited"),
+        ("insufficient_quota", "model_rate_or_quota_limit"),
+    ],
+)
+def test_credit_exhaustion_is_actionable_and_distinct_from_temporary_throttling(code, category):
+    import httpx
+    from openai import RateLimitError
+
+    client = MagicMock()
+    client.responses.create.side_effect = RateLimitError(
+        "private provider message",
+        response=httpx.Response(
+            429,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            headers={"x-request-id": "req_billing"},
+        ),
+        body={"code": code, "type": "insufficient_quota"},
+    )
+    svc = service(HalcyonAssistant(client=client, model="gpt-5.5"))
+    result = finish(
+        svc, svc.start("Can you please teach me Avril 14th by Aphex Twin? I’m a beginner.")
+    )
+    assert result["status"] == "failed"
+    assert result["result"]["stopped_reason"] == category
+    assert result["result"]["diagnostic"]["api_code"] == code
+    assert result["result"]["steps"] == []
+    assert ("Add credits" in result["result"]["reply"]) == (code == "credit_balance_exhausted")
+    assert "private provider message" not in str(result)
+    client.responses.create.assert_called_once()
+    svc._command.assert_not_called()
+
+
 def test_closing_prevents_new_actions():
     svc = service()
     svc.close()

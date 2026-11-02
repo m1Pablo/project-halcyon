@@ -161,13 +161,100 @@ def test_credentials_paths_raw_notes_and_provider_errors_are_not_forwarded():
         },
         history=[{"role": "user", "content": "not-a-standard-secret"}],
     )
-    assert result.stopped_reason == "model_unavailable"
+    assert result.stopped_reason == "model_client_error"
+    assert "sk-private-token" not in result.text
+    assert "/Users/private" not in result.text
     serialized = str(client.responses.create.call_args.kwargs)
     assert "not-a-standard-secret" not in serialized
     assert "sk-other-key" not in serialized
     assert "/Users/private" not in serialized
     assert "note': 60" not in serialized
     assert "audio" in serialized
+
+
+@pytest.mark.parametrize(
+    ("status", "category"),
+    [
+        (400, "model_request_rejected"),
+        (401, "model_authentication_failed"),
+        (403, "model_permission_denied"),
+        (404, "model_resource_not_found"),
+        (429, "model_rate_or_quota_limit"),
+        (500, "model_server_error"),
+    ],
+)
+def test_api_failure_retains_safe_diagnostics_without_retry_or_action(status, category):
+    import httpx
+    from openai import APIStatusError
+
+    client = MagicMock()
+    client.responses.create.side_effect = APIStatusError(
+        "sk-private-token /Users/private/person",
+        response=httpx.Response(
+            status,
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+            headers={"x-request-id": "req_safe123", "secret-header": "private-header"},
+        ),
+        body={"code": "unsupported_parameter", "param": "input[1].phase", "secret": "private-body"},
+    )
+    control = MagicMock()
+    result = run(client, control)
+    assert result.stopped_reason == category
+    assert result.diagnostic == {
+        "category": category,
+        "exception_type": "APIStatusError",
+        "model": "configured-model",
+        "http_status": status,
+        "api_code": "unsupported_parameter",
+        "parameter": "input[1].phase",
+        "request_id": "req_safe123",
+    }
+    assert "req_safe123" in result.text
+    assert "private" not in str(result)
+    client.responses.create.assert_called_once()
+    control.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("error_type", "category"),
+    [("APIConnectionError", "model_connection_error"), ("APITimeoutError", "model_timeout")],
+)
+def test_transport_failure_is_distinguished_from_http_rejection(error_type, category):
+    import httpx
+    import openai
+
+    client = MagicMock()
+    client.responses.create.side_effect = getattr(openai, error_type)(
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses")
+    )
+    result = run(client)
+    assert result.stopped_reason == category
+    assert result.diagnostic["http_status"] is None
+    assert result.diagnostic["request_id"] is None
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["sk-private-token", "exact-secret", "/Users/private/a", "a" * 101]
+)
+def test_diagnostic_identifiers_cannot_leak_credentials_or_paths(unsafe):
+    client = MagicMock()
+    error = RuntimeError("never publish the message")
+    error.code = error.param = error.request_id = unsafe
+    client.responses.create.side_effect = error
+    result = run(client, secret="exact-secret")
+    assert all(result.diagnostic[key] is None for key in ("api_code", "parameter", "request_id"))
+    assert unsafe not in str(result)
+
+
+def test_api_failure_after_action_preserves_completed_steps_without_replaying_them():
+    client = MagicMock()
+    client.responses.create.side_effect = [response(call("/panic")), RuntimeError("private")]
+    control = MagicMock(return_value={"ok": True, "status": "completed"})
+    result = run(client, control)
+    assert result.stopped_reason == "model_client_error"
+    assert len(result.tool_results) == 1
+    assert result.tool_results[0]["ok"] is True
+    control.assert_called_once()
 
 
 def test_feedback_retains_aggregate_scores_without_raw_events():

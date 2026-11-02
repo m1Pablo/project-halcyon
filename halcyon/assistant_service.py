@@ -233,6 +233,7 @@ class AssistantService:
                 "reply": self.assistant.safe_text(result.text),
                 "steps": result.tool_results,
                 "stopped_reason": result.stopped_reason,
+                "diagnostic": result.diagnostic,
                 "session_id": session_id,
                 "warnings": ["One or more steps failed; inspect their run results."]
                 if any(step.get("ok") is False for step in result.tool_results)

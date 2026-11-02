@@ -36,6 +36,7 @@ class AssistantResult:
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     enabled: bool = True
     stopped_reason: str | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 class HalcyonAssistant:
@@ -112,6 +113,7 @@ class HalcyonAssistant:
             text=result.text,
             tool_results=result.tool_results,
             stopped_reason=result.stopped_reason,
+            diagnostic=result.diagnostic,
         )
 
     def _app_context(self) -> dict[str, Any] | None:

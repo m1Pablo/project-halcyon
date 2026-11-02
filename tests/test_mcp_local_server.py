@@ -5,6 +5,7 @@ from urllib import error, request
 import pytest
 
 from halcyon.app import HalcyonApp
+from halcyon.assistant import HalcyonAssistant
 from halcyon.mcp_local.run_tracker import RunTracker
 from halcyon.mcp_local.server import LocalControlServer
 from halcyon.menu import load_menu
@@ -82,7 +83,9 @@ def test_app_mcp_run_slash_deduplicates_active_single_flight_group() -> None:
 
 def test_app_mcp_state_does_not_expose_environment_secrets(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-do-not-emit")
+    monkeypatch.setenv("HALCYON_CHAT_MODEL", "configured-model")
     app = _fake_halcyon_app()
+    app.assistant = HalcyonAssistant()
     app.local_control_server = SimpleNamespace(host="127.0.0.1", port=8769)
     app.synth_tool_state = lambda: {"patch": {"preset": "Init"}}
 
@@ -91,6 +94,9 @@ def test_app_mcp_state_does_not_expose_environment_secrets(monkeypatch) -> None:
     state_text = repr(state)
     assert "OPENAI_API_KEY" not in state_text
     assert "sk-test-do-not-emit" not in state_text
+    assert state["assistant"]["model"] == "configured-model"
+    app.assistant.model = "sk-test-do-not-emit"
+    assert "sk-test-do-not-emit" not in repr(app.mcp_local_state())
 
 
 class FakeServerApp:

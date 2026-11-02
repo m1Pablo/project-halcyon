@@ -69,6 +69,7 @@ class AgentResult:
     text: str
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     stopped_reason: str | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 def scrub_text(value: str, *, secret: str | None = None, limit: int = MAX_REPLY_CHARS) -> str:
@@ -106,6 +107,52 @@ def public_context(value: dict[str, Any], *, secret: str | None = None) -> dict[
         return item
 
     return scrub(bounded)
+
+
+def model_failure(exc: Exception, *, model: str, secret: str | None) -> dict[str, Any]:
+    """Expose bounded identifiers, never exception messages, bodies or headers."""
+    from openai import (
+        APIConnectionError,
+        APIResponseValidationError,
+        APIStatusError,
+        APITimeoutError,
+    )
+
+    def identifier(value: Any) -> str | None:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,100}", value):
+            return None
+        return value if scrub_text(value, secret=secret) == value else None
+
+    category = "model_client_error"
+    status = getattr(exc, "status_code", None)
+    code = identifier(getattr(exc, "code", None))
+    if isinstance(exc, APITimeoutError):
+        category = "model_timeout"
+    elif isinstance(exc, APIConnectionError):
+        category = "model_connection_error"
+    elif isinstance(exc, APIResponseValidationError):
+        category = "model_response_invalid"
+    elif isinstance(exc, APIStatusError):
+        category = {
+            400: "model_request_rejected",
+            401: "model_authentication_failed",
+            403: "model_permission_denied",
+            404: "model_resource_not_found",
+            429: "model_rate_or_quota_limit",
+        }.get(status, "model_server_error" if status >= 500 else "model_request_rejected")
+        if status == 429 and code == "credit_balance_exhausted":
+            category = "model_credit_balance_exhausted"
+        elif status == 429 and code in {"rate_limit_exceeded", "slow_down"}:
+            category = "model_rate_limited"
+    return {
+        "category": category,
+        "exception_type": identifier(type(exc).__name__),
+        "model": identifier(model),
+        "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+        "api_code": code,
+        "parameter": identifier(getattr(exc, "param", None)),
+        "request_id": identifier(getattr(exc, "request_id", None)),
+    }
 
 
 def tool_definitions() -> list[dict[str, Any]]:
@@ -235,8 +282,24 @@ def run_agent(
                 include=["reasoning.encrypted_content"],
                 max_output_tokens=4_096,
             )
-        except Exception:
-            return halt("model_unavailable")
+        except Exception as exc:
+            diagnostic = model_failure(exc, model=model, secret=secret)
+            details = "; ".join(
+                f"{key}={value}" for key, value in diagnostic.items() if value is not None
+            )
+            explanation = (
+                "OpenAI reports that the API organization's prepaid credit balance is exhausted. "
+                "Add credits in OpenAI API billing before retrying. "
+                if diagnostic["category"] == "model_credit_balance_exhausted"
+                else "The model request failed. "
+            )
+            return AgentResult(
+                explanation + f"Diagnostics: {details}. "
+                "I stopped before taking further actions. Check tracked steps before retrying.",
+                steps,
+                diagnostic["category"],
+                diagnostic,
+            )
         if stopped():
             return halt("cancelled_or_timed_out")
         tokens += _get(_get(response, "usage", {}), "total_tokens", 0) or 0

@@ -1755,6 +1755,7 @@ class HalcyonApp(App[None]):
             "tracker": tracker.get_state(),
             "assistant": {
                 "enabled": bool(getattr(getattr(self, "assistant", None), "enabled", False)),
+                "model": self.assistant.safe_text(self.assistant.model, limit=100),
                 "chat_session_id": getattr(self, "_chat_assistant_session_id", None),
             },
             "synth": self.synth_tool_state(),
