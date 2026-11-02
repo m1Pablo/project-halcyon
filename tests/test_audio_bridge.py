@@ -220,13 +220,13 @@ def test_audio_command_for_event_maps_press_and_release() -> None:
 
 
 @pytest.mark.parametrize("velocity", [1, 2, 64, 96, 127])
-def test_demonstration_audio_is_half_level_without_changing_source_or_human_events(velocity):
+def test_demonstration_audio_is_quarter_level_without_changing_source_or_human_events(velocity):
     human = make_event("press", velocity=velocity, voice_id=70)
     demonstration = make_event("press", velocity=velocity, voice_id=71, origin=MidiOrigin.HALCYON)
     human_command = audio_command_for_event(human)
     demonstration_command = audio_command_for_event(demonstration)
     assert human_command["velocity"] == velocity
-    assert demonstration_command["velocity"] == max(1, round(velocity / 2))
+    assert demonstration_command["velocity"] == max(1, round(velocity / 4))
     assert human.velocity == demonstration.velocity == velocity
     assert demonstration_command["note"] == human_command["note"] == 60
     assert demonstration_command["voice_id"] == 71
@@ -533,7 +533,7 @@ def test_owner_release_sends_only_halcyon_voice_and_panic_remains_global() -> No
 
     writes = [json.loads(line) for line in created[0].stdin.lines]
     assert writes[0]["velocity"] == 96
-    assert writes[1]["velocity"] == 48
+    assert writes[1]["velocity"] == 24
     assert writes[-2] == {
         "type": "note_off",
         "note": 60,

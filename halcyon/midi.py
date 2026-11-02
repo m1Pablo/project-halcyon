@@ -12,7 +12,7 @@ from typing import Any
 
 NOTE_OFF = 0x80
 NOTE_ON = 0x90
-HALCYON_PLAYBACK_VELOCITY_SCALE = 0.5
+HALCYON_PLAYBACK_VELOCITY_SCALE = 0.25
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 PREFERRED_PORT_TERMS = ("lpk25", "akai", "wireless")
 EVENT_TYPE_ALIASES = {
