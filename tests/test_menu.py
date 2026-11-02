@@ -12,6 +12,7 @@ def test_load_menu_exposes_initial_command_surface() -> None:
     commands = {command: payload["tool"] for command, payload in iter_slash_leaf_commands(menu_def)}
 
     assert commands == {
+        "/assistant ask": "ask_assistant",
         "/synth state": "get_synth_state",
         "/synth params": "list_synth_params",
         "/synth set": "set_synth_param",
@@ -47,10 +48,11 @@ def test_mcp_attrs_are_loaded_from_xml() -> None:
         "/coach teach",
         "/coach replay",
         "/coach attempt",
-        "/coach feedback",
     ):
         assert payloads[command]["mcp_concurrency_group"] == "coach_session"
-    for command in ("/coach state", "/coach stop"):
+        assert payloads[command].get("mcp_single_flight", True) is True
+    assert payloads["/coach feedback"]["mcp_concurrency_group"] == "coach_session"
+    for command in ("/assistant ask", "/coach feedback", "/coach state", "/coach stop"):
         assert payloads[command]["mcp_single_flight"] is False
         assert payloads[command]["mcp_parallel_ok"] is True
     assert payloads["/panic"]["mcp_single_flight"] is False
@@ -73,19 +75,22 @@ def test_coach_menu_is_the_exact_public_slash_abi() -> None:
         "/coach stop",
     ]
     assert coach["/coach teach"]["usage"] == (
-        "/coach teach QUERY [--segment LABEL --tempo 25..200 --difficulty "
+        "/coach teach QUERY [--segment LABEL --tempo 25..200 --practice melody|essentials|full --difficulty "
         "foundation|standard|challenge --hand left|right|both --loops 1..8 "
         "--author never|bounded]"
     )
     assert coach["/coach replay"]["usage"] == (
-        "/coach replay [--segment LABEL --tempo 25..200 --loops 1..8]"
+        "/coach replay [--segment LABEL --tempo 25..200 --practice melody|essentials|full --loops 1..8]"
     )
     assert coach["/coach attempt"]["usage"] == (
-        "/coach attempt [--segment LABEL --tempo 25..200 --count-in 0..8]"
+        "/coach attempt [--segment LABEL --tempo 25..200 --practice melody|essentials|full --count-in 0..8]"
     )
     assert coach["/coach feedback"]["usage"] == "/coach feedback [attempt_id]"
     assert coach["/coach state"]["usage"] == "/coach state"
     assert coach["/coach stop"]["usage"] == "/coach stop"
+    assert "default full" in coach["/coach teach"]["description"]
+    assert "retains the current note layer" in coach["/coach replay"]["description"]
+    assert "Ghost notes are optional and unscored" in coach["/coach attempt"]["description"]
 
 
 def test_leaf_without_tool_is_rejected(tmp_path: Path) -> None:

@@ -308,7 +308,25 @@ def test_named_work_miss_with_author_never_requires_source_without_provider_call
     assert caught.value.code == "SOURCE_REQUIRED"
     assert caught.value.retryable is True
     assert '--segment "main melody"' in caught.value.resolution
-    assert "without --author never" in caught.value.resolution
+    assert "Check the saved lesson library" in caught.value.resolution
+    assert "--author bounded" in caught.value.resolution
+    assert provider.calls == 0
+    assert not lesson_service.store.root.exists()
+
+
+@pytest.mark.parametrize("practice_level", ["melody", "essentials"])
+def test_reduced_uncached_authoring_never_calls_provider_or_persists(
+    tmp_path, practice_level
+) -> None:
+    provider = FakeProvider()
+    lesson_service = service(tmp_path, provider)
+
+    with pytest.raises(coach_authoring.CoachError) as caught:
+        lesson_service.resolve(bounded_request(practice_level=practice_level))
+
+    assert caught.value.code == "PRACTICE_UNAVAILABLE"
+    assert caught.value.field == "practice"
+    assert "--practice full" in caught.value.resolution
     assert provider.calls == 0
     assert not lesson_service.store.root.exists()
 

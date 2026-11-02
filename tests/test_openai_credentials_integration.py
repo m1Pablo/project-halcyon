@@ -7,16 +7,19 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+from textual import events
+
 from halcyon.app import HalcyonApp, _OpenAICredentialOperation
 from halcyon.audio_bridge import AudioBridgeSnapshot
 from halcyon.audio_viz import AudioVisualizationSnapshot
-from halcyon.chat_router import RoutingDecision
+from halcyon.agent import AgentResult
 from halcyon.coach_authoring import (
     DEFAULT_COACH_MODEL,
     LessonService,
     OpenAILessonAuthoringProvider,
 )
 from halcyon.coach_store import LessonStore
+from halcyon.console_events import ConsoleEvent
 from halcyon.midi import MidiEvent
 from halcyon.openai_credentials import (
     CredentialSource,
@@ -156,6 +159,9 @@ class FakeOpenAIClient:
     def __repr__(self) -> str:
         return "FakeOpenAIClient(api_key=<redacted>)"
 
+    def close(self) -> None:
+        pass
+
 
 class ReleaseCredentialReadOnUnmountApp(HalcyonApp):
     """Release native I/O only after Halcyon's unmount guards are installed."""
@@ -188,7 +194,9 @@ async def wait_until(predicate: Callable[[], bool], *, timeout: float = 2.0) -> 
 def install_fake_openai(monkeypatch: Any) -> list[str]:
     constructed_with: list[str] = []
 
-    def fake_openai(*, api_key: str) -> FakeOpenAIClient:
+    def fake_openai(
+        *, api_key: str, timeout: float | None = None, max_retries: int | None = None
+    ) -> FakeOpenAIClient:
         constructed_with.append(api_key)
         return FakeOpenAIClient(api_key)
 
@@ -244,7 +252,52 @@ def provider_key(app: HalcyonApp) -> str | None:
 
 
 def transcript_text(app: HalcyonApp) -> str:
-    return "\n".join(str(getattr(line, "text", line)) for line in app.chat_panel.transcript.lines)
+    return "\n".join(event.text for event in app.chat_panel.transcript.entries)
+
+
+def test_console_auto_copy_never_reaches_masked_credential_selection(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    app = make_app(tmp_path, monkeypatch, make_store(MemorySecretBackend()), suffix="clipboard")
+    copies: list[str] = []
+    native_calls: list[object] = []
+    monkeypatch.setattr(app, "copy_to_clipboard", copies.append)
+    monkeypatch.setattr(
+        "halcyon.console_clipboard.subprocess.run",
+        lambda *args, **kwargs: native_calls.append((args, kwargs)),
+    )
+
+    async def run() -> None:
+        async with app.run_test(size=(120, 42)) as pilot:
+            await wait_until(lambda: not app._credential_busy)
+            app.assistant.set_api_key(REPLACEMENT_KEY)
+            app.action_toggle_settings()
+            await pilot.pause()
+            key_input = app.settings_screen.openai_key_input
+            key_input.value = REPLACEMENT_KEY
+            key_input.focus()
+            key_input.action_select_all()
+            app.post_message(events.TextSelected())
+            await pilot.mouse_up("#openai-key-input", offset=(3, 1))
+            await pilot.pause()
+            assert key_input.password
+            assert copies == native_calls == []
+            assert REPLACEMENT_KEY not in transcript_text(app)
+            app._receive_console_event(
+                ConsoleEvent(
+                    "credential-regression",
+                    "log",
+                    "system",
+                    "system",
+                    REPLACEMENT_KEY,
+                    raw_text=REPLACEMENT_KEY,
+                    details=REPLACEMENT_KEY,
+                )
+            )
+            assert REPLACEMENT_KEY not in repr(app.chat_panel.transcript.entries)
+            assert REPLACEMENT_KEY not in json.dumps(app.mcp_local_state())
+
+    asyncio.run(run())
 
 
 def test_saved_key_survives_a_full_app_restart_and_rehydrates_clients(
@@ -396,13 +449,11 @@ def test_failed_save_keeps_previous_effective_key_provider_and_status(
     constructed_with = install_fake_openai(monkeypatch)
     routed_with: list[str | None] = []
 
-    def fake_route(
-        *_args: object, api_key: str | None = None, **_kwargs: object
-    ) -> RoutingDecision:
-        routed_with.append(api_key)
-        return RoutingDecision(action="reject", reason="synthetic routing result")
+    def fake_agent(*_args: object, secret: str | None = None, **_kwargs: object) -> AgentResult:
+        routed_with.append(secret)
+        return AgentResult("synthetic assistant result")
 
-    monkeypatch.setattr("halcyon.assistant.run_chat_routing", fake_route)
+    monkeypatch.setattr("halcyon.assistant.run_agent", fake_agent)
     backend = MemorySecretBackend(STORED_KEY)
     app = make_app(tmp_path, monkeypatch, make_store(backend), suffix="failed-save")
 
@@ -416,7 +467,7 @@ def test_failed_save_keeps_previous_effective_key_provider_and_status(
             assert app._start_openai_credential_operation("save", secret=REPLACEMENT_KEY)
             await wait_until(lambda: not app._credential_busy)
 
-            app.assistant.ask("keep using the established credential")
+            app.assistant.ask("keep using the established credential", control=lambda *_args: {})
             assert routed_with[-1] == STORED_KEY
             assert app.lesson_service.provider is original_provider
             assert app._credential_status == original_status
@@ -424,7 +475,7 @@ def test_failed_save_keeps_previous_effective_key_provider_and_status(
             assert "unchanged" in transcript_text(app).lower()
 
     asyncio.run(run())
-    assert constructed_with == [STORED_KEY]
+    assert constructed_with == [STORED_KEY, STORED_KEY]
 
 
 def test_injected_lesson_service_provider_is_never_reconfigured(

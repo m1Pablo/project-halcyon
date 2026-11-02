@@ -18,6 +18,7 @@ from halcyon.coach_models import (
     normalize_lesson_alias,
     validate_lesson_revision,
 )
+from halcyon.coach_practice import practice_levels
 
 CATALOG_SCHEMA_VERSION = 1
 CATALOG_FILENAME = "catalog-v1.json"
@@ -146,6 +147,65 @@ class LessonStore:
 
         return normalize_lesson_alias(alias) in self._builtin_aliases
 
+    def library(self) -> list[dict[str, Any]]:
+        """Describe usable saved lessons without rebuilding or changing local data."""
+
+        # Preserve the catalog's newer-schema gate, but discover aliases from
+        # validated manifests/bindings even if its derived index is stale.
+        self._catalog_for_persist_preflight()
+        catalog = self._scan_manifests()
+        revisions: dict[tuple[str, str], tuple[LessonRevision, list[str]]] = {}
+        for alias in sorted(set(catalog["aliases"]) | self._builtin_aliases.keys()):
+            try:
+                lesson = self._builtin_aliases.get(alias)
+                if lesson is None:
+                    reference = _reference_from_dict(catalog["aliases"][alias])
+                    lesson = self._lesson_for_reference(alias, reference)
+                if lesson is None:
+                    continue
+            except CoachError:
+                continue
+            key = (lesson.lesson_id, lesson.content_id)
+            if key not in revisions:
+                revisions[key] = (lesson, [])
+            revisions[key][1].append(alias)
+
+        ordered = sorted(
+            revisions.values(),
+            key=lambda item: (
+                not (
+                    item[0].provenance.acquisition.value == "user_supplied"
+                    and item[0].provenance.fidelity.value == "verified"
+                ),
+                item[0].title.casefold(),
+                item[0].lesson_id,
+                item[0].content_id,
+            ),
+        )
+        return [
+            {
+                "title": lesson.title,
+                "composer": lesson.composer,
+                "query": aliases[0],
+                "aliases": aliases[:8],
+                "acquisition": lesson.provenance.acquisition.value,
+                "fidelity": lesson.provenance.fidelity.value,
+                "practice_levels": list(practice_levels(lesson.content_id)),
+                "segments": [segment.label for segment in lesson.segments[:16]],
+                "segment_hands": {
+                    segment.label: hand.value if (hand := segment.hand or lesson.hand) else None
+                    for segment in lesson.segments[:16]
+                },
+                "segment_difficulties": {
+                    segment.label: difficulty.value
+                    if (difficulty := segment.difficulty or lesson.difficulty)
+                    else None
+                    for segment in lesson.segments[:16]
+                },
+            }
+            for lesson, aliases in ordered[:16]
+        ]
+
     def resolve(self, request_alias: str) -> LessonRevision | None:
         """Resolve a normalized alias, with packaged built-ins taking precedence."""
 
@@ -154,6 +214,11 @@ class LessonStore:
             return builtin
         catalog = self._load_catalog()
         reference = self._resolve_local_reference(alias, catalog)
+        return self._lesson_for_reference(alias, reference)
+
+    def _lesson_for_reference(
+        self, alias: str, reference: LessonReference | None
+    ) -> LessonRevision | None:
         supersession_path = self.alias_supersession_path(alias)
         if supersession_path.exists():
             supersession = _read_alias_supersession(

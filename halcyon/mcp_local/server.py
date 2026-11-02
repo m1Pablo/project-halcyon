@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import re
+import shlex
 import socket
 import threading
 from typing import TYPE_CHECKING, Any, Callable
@@ -187,6 +188,24 @@ class LocalControlServer:
     def run_logs(self, run_id: str) -> dict[str, Any] | None:
         return self._call_app(lambda app: app.mcp_local_run_logs(run_id))
 
+    def wait_for_run(self, run_id: str, *, cursor: int, max_wait_s: float) -> dict[str, Any] | None:
+        # RunTracker is thread-safe. A wait must never occupy Textual's event loop.
+        return self._app().mcp_local_wait_for_run(run_id, cursor=cursor, max_wait_s=max_wait_s)
+
+    def ask(
+        self, goal: str, *, session_id: str | None, source: str, max_wait_s: float
+    ) -> tuple[int, dict[str, Any]]:
+        command = "/assistant ask " + shlex.quote(goal)
+        if session_id is not None:
+            command += " --session-id " + session_id
+        code, result = self.run_slash(command=command, source=source, timeout_s=600.0)
+        if result.get("started"):
+            waited = self.wait_for_run(result["run_id"], cursor=0, max_wait_s=max_wait_s)
+            if waited is not None:
+                result.update(waited)
+                code = 200 if waited["terminal"] else 202
+        return code, result
+
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         control = self
 
@@ -195,6 +214,28 @@ class LocalControlServer:
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
+
+            def _trusted_request(self) -> bool:
+                origin_value = self.headers.get("Origin")
+                try:
+                    host = urlparse("http://" + self.headers.get("Host", ""))
+                    valid_host = (
+                        host.hostname in {"127.0.0.1", "localhost"}
+                        and host.port == control.port
+                        and host.username is None
+                        and not host.path
+                    )
+                    if origin_value is None:
+                        return valid_host
+                    origin = urlparse(origin_value)
+                    return (
+                        valid_host
+                        and origin.scheme == "http"
+                        and origin.hostname in {"127.0.0.1", "localhost"}
+                        and origin.port == control.port
+                    )
+                except ValueError:
+                    return False
 
             def _json(self, status: int, payload: dict[str, Any]) -> None:
                 try:
@@ -244,7 +285,10 @@ class LocalControlServer:
                     return None, HTTPStatus.BAD_REQUEST
                 if length <= 0:
                     return None, HTTPStatus.BAD_REQUEST
-                if length > _MAX_REQUEST_BODY_BYTES:
+                body_limit = (
+                    16_384 if urlparse(self.path).path == "/ask" else _MAX_REQUEST_BODY_BYTES
+                )
+                if length > body_limit:
                     self.close_connection = True
                     return None, HTTPStatus.REQUEST_ENTITY_TOO_LARGE
                 try:
@@ -275,6 +319,10 @@ class LocalControlServer:
                 return run_id.lower() if _RUN_ID_RE.fullmatch(run_id) else None
 
             def do_GET(self) -> None:  # noqa: N802
+                if not self._trusted_request():
+                    self.close_connection = True
+                    self._json(403, _error_payload("INVALID_REQUEST", "Local requests only."))
+                    return
                 parsed_path = urlparse(self.path)
                 if "?" in self.path or parsed_path.query:
                     self._json(
@@ -330,6 +378,10 @@ class LocalControlServer:
                 )
 
             def do_POST(self) -> None:  # noqa: N802
+                if not self._trusted_request():
+                    self.close_connection = True
+                    self._json(403, _error_payload("INVALID_REQUEST", "Local requests only."))
+                    return
                 parsed_path = urlparse(self.path)
                 if "?" in self.path or parsed_path.query:
                     self.close_connection = True
@@ -339,7 +391,7 @@ class LocalControlServer:
                     )
                     return
                 path = parsed_path.path
-                if path != "/run_slash":
+                if path not in {"/run_slash", "/ask", "/wait_for_run"}:
                     self.close_connection = True
                     self._json(
                         HTTPStatus.NOT_FOUND,
@@ -362,6 +414,9 @@ class LocalControlServer:
                     self._json(read_error, _error_payload(code, message))
                     return
                 assert payload is not None
+                if path in {"/ask", "/wait_for_run"}:
+                    self._handle_assistant(path, payload)
+                    return
                 if not set(payload).issubset({"command", "source", "timeout_s"}):
                     self._json(
                         HTTPStatus.BAD_REQUEST,
@@ -433,6 +488,85 @@ class LocalControlServer:
                     self._unavailable()
                     return
                 self._json(status, result)
+
+            def _handle_assistant(self, path: str, payload: dict[str, Any]) -> None:
+                allowed = (
+                    {"goal", "session_id", "source", "max_wait_s"}
+                    if path == "/ask"
+                    else {"run_id", "cursor", "max_wait_s"}
+                )
+                wait = payload.get("max_wait_s", 1.0)
+                valid_wait = (
+                    not isinstance(wait, bool)
+                    and isinstance(wait, (int, float))
+                    and math.isfinite(wait)
+                    and 0 <= wait <= 10
+                )
+                if not set(payload).issubset(allowed) or not valid_wait:
+                    self._json(
+                        400,
+                        _error_payload(
+                            "INVALID_ARGUMENTS",
+                            "Use declared arguments and max_wait_s between 0 and 10.",
+                        ),
+                    )
+                    return
+                try:
+                    if path == "/ask":
+                        goal = payload.get("goal")
+                        session_id = payload.get("session_id")
+                        source = payload.get("source", "llm")
+                        if (
+                            not isinstance(goal, str)
+                            or not goal.strip()
+                            or len(goal) > 2_000
+                            or not isinstance(source, str)
+                            or source not in _ALLOWED_SOURCES
+                            or (
+                                "session_id" in payload
+                                and (
+                                    not isinstance(session_id, str)
+                                    or not _RUN_ID_RE.fullmatch(session_id)
+                                )
+                            )
+                        ):
+                            self._json(
+                                400,
+                                _error_payload(
+                                    "INVALID_ARGUMENTS",
+                                    "Use a goal of 1 through 2000 characters and a returned session_id if continuing.",
+                                ),
+                            )
+                            return
+                        code, result = control.ask(
+                            goal, session_id=session_id, source=source, max_wait_s=float(wait)
+                        )
+                        self._json(code, result)
+                    else:
+                        run_id = payload.get("run_id")
+                        cursor = payload.get("cursor", 0)
+                        if (
+                            not isinstance(run_id, str)
+                            or not _RUN_ID_RE.fullmatch(run_id)
+                            or isinstance(cursor, bool)
+                            or not isinstance(cursor, int)
+                            or not 0 <= cursor <= 2**53
+                        ):
+                            self._json(
+                                400,
+                                _error_payload(
+                                    "INVALID_ARGUMENTS",
+                                    "Use a returned run_id and a nonnegative integer cursor.",
+                                ),
+                            )
+                            return
+                        self._handle_lookup(
+                            control.wait_for_run(
+                                run_id.lower(), cursor=cursor, max_wait_s=float(wait)
+                            )
+                        )
+                except Exception:
+                    self._unavailable()
 
             def _handle_lookup(self, payload: dict[str, Any] | None) -> None:
                 if payload is None:

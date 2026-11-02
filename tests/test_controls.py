@@ -60,6 +60,10 @@ def test_knob_keypress_updates_patch_and_streams_to_audio(monkeypatch) -> None:
         app.midi = FakeMidi()  # type: ignore[assignment]
 
         async with app.run_test() as pilot:
+            await pilot.pause()
+            app.screen.set_focus(None)
+            await pilot.pause()
+            assert not app.chat_panel.input.has_focus
             await pilot.press("comma")
             await pilot.pause()
             assert app.screen is app.settings_screen
@@ -86,7 +90,8 @@ def test_knob_buttons_increment_and_decrement(monkeypatch) -> None:
         app.midi = FakeMidi()  # type: ignore[assignment]
 
         async with app.run_test(size=(180, 52)) as pilot:
-            await pilot.press("comma")
+            app.chat_panel.input.focus()
+            await pilot.press("f2")
             await pilot.pause()
             assert app.screen is app.settings_screen
             app.settings_screen.query_one("#knob-volume-up").focus()
@@ -111,14 +116,24 @@ def test_chat_input_accepts_text_without_api_key(monkeypatch) -> None:
         app = HalcyonApp()
         app.audio = FakeAudio()  # type: ignore[assignment]
         app.midi = FakeMidi()  # type: ignore[assignment]
+        requests: list[str] = []
+        submit_natural_chat = app._submit_natural_chat
+
+        def record_request(text: str) -> None:
+            requests.append(text)
+            submit_natural_chat(text)
+
+        app._submit_natural_chat = record_request  # type: ignore[method-assign]
 
         async with app.run_test(size=(140, 48)) as pilot:
+            app.chat_panel.input.focus()
             app.chat_panel.input.value = "make it warmer"
-            await pilot.click("#chat-send")
+            await pilot.press("enter")
             await pilot.pause()
 
             assert not app.chat_panel.input.disabled
             assert app.chat_panel.input.value == ""
+            assert requests == ["make it warmer"]
 
     asyncio.run(run())
 
@@ -134,7 +149,8 @@ def test_preset_save_flow_validates_cancels_and_saves(monkeypatch, tmp_path) -> 
 
         async with app.run_test(size=(180, 60)) as pilot:
             app.synth_rack.apply_patch({"tone": 0.21, "release": 0.42}, emit=False)
-            await pilot.press("comma")
+            app.chat_panel.input.focus()
+            await pilot.press("f2")
             await pilot.pause()
             assert app.screen is app.settings_screen
             await pilot.click("#preset-save")

@@ -3,6 +3,7 @@ name = "project-halcyon"
 version = "0.1.0"
 description = "Textual MIDI controller, synth, and drum experiment."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "keyring>=25.6,<26",
@@ -27,6 +28,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["halcyon"]
+
+[tool.uv]
+# Avoid stripped Mach-O wheels with misaligned LINKEDIT on macOS 27.
+no-binary-package = ["pydantic-core", "jiter"]
+
+[tool.uv.extra-build-variables]
+pydantic-core = { CARGO_PROFILE_RELEASE_STRIP = "none", CARGO_PROFILE_RELEASE_DEBUG = "1" }
+jiter = { CARGO_PROFILE_RELEASE_STRIP = "none", CARGO_PROFILE_RELEASE_DEBUG = "1" }
 
 [tool.ruff]
 line-length = 100

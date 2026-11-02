@@ -1,4 +1,4 @@
-"""Router-only Halcyon assistant constrained to menu slash commands."""
+"""Conversational Halcyon assistant constrained to registered slash commands."""
 
 from __future__ import annotations
 
@@ -7,12 +7,8 @@ import os
 import threading
 from typing import Any, Callable
 
-from halcyon.chat_router import (
-    DEFAULT_ROUTER_MODEL,
-    MISSING_KEY_REASON,
-    RoutingDecision,
-    run_chat_routing,
-)
+from halcyon.agent import Control, run_agent, scrub_text, tool_definitions
+from halcyon.chat_router import DEFAULT_ROUTER_MODEL
 from halcyon.command_executor import (
     CommandProgress,
     ImmediateCommandOutcome,
@@ -20,8 +16,12 @@ from halcyon.command_executor import (
     TerminalCommandOutcome,
 )
 from halcyon.mcp_tools import execute_tool
+from halcyon.menu import load_menu
 
-DISABLED_MESSAGE = MISSING_KEY_REASON
+DISABLED_MESSAGE = (
+    "The assistant is disabled: add an OpenAI API key in Settings or set "
+    "OPENAI_API_KEY in your environment. Slash commands still work."
+)
 
 ToolExecutor = Callable[[str, dict[str, Any]], dict[str, Any]]
 ContextProvider = Callable[[], dict[str, Any]]
@@ -33,13 +33,14 @@ MAX_ASSISTANT_HISTORY_TEXT = 1_000
 @dataclass(frozen=True)
 class AssistantResult:
     text: str
-    decision: RoutingDecision
     tool_results: list[dict[str, Any]] = field(default_factory=list)
     enabled: bool = True
+    stopped_reason: str | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 class HalcyonAssistant:
-    """Compatibility wrapper around the slash-command router."""
+    """Credential-aware entry point for the shared app-owned agent."""
 
     def __init__(
         self,
@@ -50,14 +51,13 @@ class HalcyonAssistant:
         client: Any | None = None,
         context_provider: ContextProvider | None = None,
     ) -> None:
-        self.menu_def = menu_def
+        self.menu_def = menu_def if menu_def is not None else load_menu()
         self.model = model or os.environ.get("HALCYON_CHAT_MODEL") or DEFAULT_ROUTER_MODEL
         self._lock = threading.RLock()
         selected_key = api_key if api_key is not None else os.environ.get("OPENAI_API_KEY")
         self._api_key = _normalize_optional_api_key(selected_key)
         self._client = client
         self._context_provider = context_provider
-        self._history: list[dict[str, str]] = []
 
     @property
     def enabled(self) -> bool:
@@ -70,26 +70,50 @@ class HalcyonAssistant:
         with self._lock:
             self._api_key = _normalize_optional_api_key(api_key)
 
-    def ask(self, message: str) -> AssistantResult:
+    def safe_text(self, text: str, *, limit: int = 2_000) -> str:
+        with self._lock:
+            return scrub_text(text, secret=self._api_key, limit=limit)
+
+    def ask(
+        self,
+        message: str,
+        *,
+        control: Control,
+        history: list[dict[str, str]] | None = None,
+        stopped: Callable[[], bool] = lambda: False,
+        progress: Callable[[str], None] = lambda _message: None,
+    ) -> AssistantResult:
         with self._lock:
             client = self._client
             api_key = self._api_key
-            chat_context = [dict(entry) for entry in self._history]
-        decision = run_chat_routing(
-            message,
-            menu_def=self.menu_def,
-            app_context=self._app_context(),
-            chat_context=chat_context,
-            client=client,
-            api_key=api_key,
-            model=self.model,
-        )
-        text = _decision_text(decision)
-        self._remember(message, text)
+        if client is None and not api_key:
+            return AssistantResult(DISABLED_MESSAGE, enabled=False, stopped_reason="missing_key")
+        owned_client = client is None
+        if client is None:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key, timeout=30.0, max_retries=0)
+        try:
+            result = run_agent(
+                message,
+                client=client,
+                model=self.model,
+                menu_def=self.menu_def,
+                context=self._app_context() or {},
+                history=history or [],
+                control=control,
+                stopped=stopped,
+                progress=progress,
+                secret=api_key,
+            )
+        finally:
+            if owned_client:
+                client.close()
         return AssistantResult(
-            text=text,
-            decision=decision,
-            enabled=self.enabled or decision.action == "menu",
+            text=result.text,
+            tool_results=result.tool_results,
+            stopped_reason=result.stopped_reason,
+            diagnostic=result.diagnostic,
         )
 
     def _app_context(self) -> dict[str, Any] | None:
@@ -101,22 +125,6 @@ class HalcyonAssistant:
             return None
         return context if isinstance(context, dict) else None
 
-    def _remember(self, user_message: str, assistant_message: str) -> None:
-        with self._lock:
-            self._history.extend(
-                (
-                    {
-                        "role": "user",
-                        "content": str(user_message)[:MAX_ASSISTANT_HISTORY_TEXT],
-                    },
-                    {
-                        "role": "assistant",
-                        "content": str(assistant_message)[:MAX_ASSISTANT_HISTORY_TEXT],
-                    },
-                )
-            )
-            del self._history[:-MAX_ASSISTANT_HISTORY_ENTRIES]
-
 
 def _normalize_optional_api_key(api_key: str | None) -> str | None:
     if api_key is None:
@@ -126,9 +134,9 @@ def _normalize_optional_api_key(api_key: str | None) -> str | None:
 
 
 def openai_tool_definitions() -> list[dict[str, Any]]:
-    """Return no raw tools; the LLM may only emit menu slash commands."""
+    """The model receives only command control, never raw synth tools."""
 
-    return []
+    return tool_definitions()
 
 
 def local_tool_executor(host: object) -> ToolExecutor:
@@ -228,10 +236,3 @@ def render_command_terminal(
 def _bounded_operation_text(value: str) -> str:
     normalized = " ".join(str(value).split())
     return normalized[:MAX_ASSISTANT_OPERATION_TEXT]
-
-
-def _decision_text(decision: RoutingDecision) -> str:
-    if decision.action == "reject":
-        return _bounded_operation_text(decision.reason or "I could not route that request.")
-    commands = ", ".join(f"`{command}`" for command in decision.commands)
-    return _bounded_operation_text(f"Routing to {commands}.")

@@ -1023,3 +1023,276 @@ def test_default_path_uses_xdg_data_and_env_override_outside_repo(tmp_path, monk
     assert store.catalog_path.is_file()
     repository = Path(__file__).resolve().parents[1]
     assert not store.root.resolve().is_relative_to(repository)
+
+
+def library_lesson(
+    *,
+    lesson_id: str,
+    aliases: tuple[str, ...],
+    title: str,
+    segments: tuple[str, ...] = ("main melody",),
+    imported: bool = True,
+    note: int = 60,
+    segment_hand: str | None = None,
+    segment_difficulty: str | None = None,
+):
+    base = make_lesson(lesson_id=lesson_id, alias=aliases[0], note=note)
+    return create_lesson_revision(
+        lesson_id=lesson_id,
+        created_at=NOW,
+        aliases=aliases,
+        title=title,
+        composer="Test Composer",
+        difficulty=None,
+        hand=None,
+        ppq=base.ppq,
+        tempo_map=base.tempo_map,
+        time_signatures=base.time_signatures,
+        provenance=LessonProvenance(
+            Acquisition.USER_SUPPLIED if imported else Acquisition.LOCALLY_AUTHORED_BOUNDED,
+            "Private source /Users/private/song.mid sk-private-citation",
+            Fidelity.VERIFIED if imported else Fidelity.APPROXIMATE,
+            NOW,
+            provider=None if imported else "synthetic",
+            model_version=None if imported else "synthetic",
+        ),
+        events=base.events,
+        segments=tuple(
+            LessonSegment(label, 0, 480, hand=segment_hand, difficulty=segment_difficulty)
+            for label in segments
+        ),
+    )
+
+
+def library_tree(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()
+    }
+
+
+def test_library_lists_effective_imports_before_approximations_without_writing(tmp_path) -> None:
+    store = LessonStore(root=tmp_path / "coach")
+    old = library_lesson(
+        lesson_id="avril",
+        aliases=("Aphex Twin Avril 14th",),
+        title="Avril approximation",
+        imported=False,
+    )
+    imported = library_lesson(
+        lesson_id="avril",
+        aliases=("Aphex Twin Avril 14th imported archive", "Aphex Twin's Avril 14th"),
+        title="Avril 14th",
+        note=62,
+    )
+    satie = library_lesson(
+        lesson_id="satie",
+        aliases=("Satie Gymnopedie No 1", "Gymnopédie No. 1"),
+        title="Gymnopédie No. 1",
+        segments=("complete piece",),
+    )
+    generated = library_lesson(
+        lesson_id="generated",
+        aliases=("Avril 14",),
+        title="A generated approximation",
+        imported=False,
+    )
+    for lesson in (old, imported, satie, generated):
+        store.persist(lesson)
+    store.supersede_alias(
+        old.aliases[0], expected=lesson_reference(old), replacement=lesson_reference(imported)
+    )
+    before = library_tree(store.root)
+
+    entries = store.library()
+
+    assert library_tree(store.root) == before
+    assert [entry["title"] for entry in entries] == [
+        "Avril 14th",
+        "Gymnopédie No. 1",
+        "A generated approximation",
+    ]
+    assert entries[0] == {
+        "title": "Avril 14th",
+        "composer": "Test Composer",
+        "query": "aphex twin avril 14th",
+        "aliases": sorted((old.aliases[0], *imported.aliases)),
+        "acquisition": "user_supplied",
+        "fidelity": "verified",
+        "practice_levels": ["full"],
+        "segments": ["main melody"],
+        "segment_hands": {"main melody": None},
+        "segment_difficulties": {"main melody": None},
+    }
+    assert entries[1]["segments"] == ["complete piece"]
+    assert entries[2]["fidelity"] == "approximate"
+    for entry, expected in zip(entries, (imported, satie, generated), strict=True):
+        assert store.resolve(entry["query"]) == expected
+        assert all(store.resolve(alias) == expected for alias in entry["aliases"])
+    rendered = json.dumps(entries)
+    assert "/Users/private" not in rendered
+    assert "sk-private-citation" not in rendered
+    assert "event" not in rendered
+    assert "source_port" not in rendered
+    assert "note" not in rendered
+
+
+@pytest.mark.parametrize("catalog_state", ["missing", "corrupt", "stale"])
+def test_library_discovers_saved_lessons_without_repairing_catalog(tmp_path, catalog_state) -> None:
+    store = LessonStore(root=tmp_path / "coach")
+    lesson = make_lesson()
+    store.persist(lesson)
+    if catalog_state == "missing":
+        store.catalog_path.unlink()
+    elif catalog_state == "corrupt":
+        store.catalog_path.write_text("{broken", encoding="utf-8")
+    else:
+        store.catalog_path.write_text(
+            '{"schema_version":1,"aliases":{},"excluded_aliases":{}}', encoding="utf-8"
+        )
+    before = library_tree(store.root)
+
+    entries = LessonStore(root=store.root).library()
+
+    assert entries[0]["query"] == lesson.aliases[0]
+    assert library_tree(store.root) == before
+
+
+def test_library_missing_root_does_not_create_it(tmp_path) -> None:
+    store = LessonStore(root=tmp_path / "absent")
+
+    assert store.library() == []
+    assert not store.root.exists()
+
+
+def test_library_preserves_builtin_alias_precedence(tmp_path) -> None:
+    local = make_lesson(alias="shared alias", note=61)
+    builtin = make_lesson(lesson_id="builtin", alias="shared alias", note=62)
+    LessonStore(root=tmp_path / "coach").persist(local)
+    store = LessonStore(root=tmp_path / "coach", builtins=(builtin,))
+    before = library_tree(store.root)
+
+    entries = store.library()
+
+    assert len(entries) == 1
+    assert store.resolve(entries[0]["query"]) == builtin
+    assert library_tree(store.root) == before
+
+
+def test_library_skips_corrupt_entries_and_bad_supersessions_without_writes(tmp_path) -> None:
+    store = LessonStore(root=tmp_path / "coach")
+    bad = make_lesson(lesson_id="bad", alias="bad entry")
+    good = make_lesson(lesson_id="good", alias="good entry")
+    base, replacement = persisted_supersession_pair(store)
+    store.persist(bad)
+    store.persist(good)
+    store.supersede_alias(
+        base.aliases[0], expected=lesson_reference(base), replacement=lesson_reference(replacement)
+    )
+    store.revision_path(bad.lesson_id, bad.content_id).write_text("{broken", encoding="utf-8")
+    store.alias_supersession_path(base.aliases[0]).write_text("{broken", encoding="utf-8")
+    before = library_tree(store.root)
+
+    entries = store.library()
+
+    aliases = [alias for entry in entries for alias in entry["aliases"]]
+    assert "bad entry" not in aliases
+    assert base.aliases[0] not in aliases
+    assert "good entry" in aliases
+    assert replacement.aliases[0] in aliases
+    assert library_tree(store.root) == before
+
+
+def test_library_rejects_newer_catalog_without_writes(tmp_path) -> None:
+    store = LessonStore(root=tmp_path / "coach")
+    store.persist(make_lesson())
+    store.catalog_path.write_text('{"schema_version":2}', encoding="utf-8")
+    before = library_tree(store.root)
+
+    with pytest.raises(CoachError) as caught:
+        store.library()
+
+    assert caught.value.code == "SCHEMA_UNSUPPORTED"
+    assert library_tree(store.root) == before
+
+
+def test_library_bounds_entries_aliases_segments_and_keeps_imports_first(tmp_path) -> None:
+    lessons = tuple(
+        library_lesson(
+            lesson_id=f"piece-{index}",
+            aliases=tuple(f"piece {index} alias {alias}" for alias in range(12)),
+            title=f"Piece {index:02}",
+            segments=tuple(f"section {part}" for part in range(20)),
+            imported=index == 17,
+        )
+        for index in range(18)
+    )
+    store = LessonStore(root=tmp_path / "coach", builtins=lessons)
+
+    entries = store.library()
+
+    assert len(entries) == 16
+    assert entries[0]["title"] == "Piece 17"
+    assert all(len(entry["aliases"]) == 8 for entry in entries)
+    assert all(len(entry["segments"]) == 16 for entry in entries)
+    assert all(len(entry["segment_hands"]) == 16 for entry in entries)
+    assert all(len(entry["segment_difficulties"]) == 16 for entry in entries)
+    assert all(store.resolve(entry["query"]) is not None for entry in entries)
+    assert not store.root.exists()
+
+
+def test_library_reports_segment_selection_overrides_and_lesson_fallbacks(tmp_path) -> None:
+    fallback = replace(
+        library_lesson(lesson_id="fallback", aliases=("fallback",), title="Fallback"),
+        hand="left",
+        difficulty="standard",
+    )
+    override = replace(
+        library_lesson(
+            lesson_id="override",
+            aliases=("override",),
+            title="Override",
+            segment_hand="right",
+            segment_difficulty="foundation",
+        ),
+        hand="both",
+        difficulty="challenge",
+    )
+    store = LessonStore(root=tmp_path / "coach", builtins=(fallback, override))
+
+    first, second = store.library()
+
+    assert first["segment_hands"] == {"main melody": "left"}
+    assert first["segment_difficulties"] == {"main melody": "standard"}
+    assert second["segment_hands"] == {"main melody": "right"}
+    assert second["segment_difficulties"] == {"main melody": "foundation"}
+
+
+def test_library_reports_practice_support_for_effective_source_without_writes(
+    tmp_path, monkeypatch
+) -> None:
+    old = library_lesson(lesson_id="old", aliases=("saved song",), title="Old", note=60)
+    imported = library_lesson(
+        lesson_id="old", aliases=("imported song",), title="Imported", note=62
+    )
+    store = LessonStore(root=tmp_path / "coach")
+    store.persist(old)
+    store.persist(imported)
+    store.supersede_alias(
+        "saved song", expected=lesson_reference(old), replacement=lesson_reference(imported)
+    )
+    seen = []
+
+    def supported(content_id):
+        seen.append(content_id)
+        return ("melody", "essentials", "full") if content_id == imported.content_id else ("full",)
+
+    monkeypatch.setattr("halcyon.coach_store.practice_levels", supported)
+    before = library_tree(store.root)
+
+    entries = store.library()
+
+    assert len(entries) == 1
+    assert entries[0]["practice_levels"] == ["melody", "essentials", "full"]
+    assert seen == [imported.content_id]
+    assert library_tree(store.root) == before
+    assert "content_id" not in entries[0]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Executor, Future, ThreadPoolExecutor
@@ -14,6 +15,11 @@ from typing import Any, Literal, Protocol
 import uuid
 
 from halcyon.coach_authoring import AuthoringControl, LessonService
+from halcyon.coach_highway import (
+    CoachReviewSummary,
+    CoachVisualizationSnapshot,
+    project_note_spans,
+)
 from halcyon.coach_models import (
     AuthorMode,
     CoachError,
@@ -30,6 +36,7 @@ from halcyon.coach_models import (
     resolve_timeline,
 )
 from halcyon.coach_scoring import CoachingReport, ScoreRequest, score_attempt
+from halcyon.coach_practice import PracticeLevel
 from halcyon.command_executor import (
     CommandProgress,
     ImmediateCommandOutcome,
@@ -156,6 +163,9 @@ class _CoachSession:
     capture_started_ns: int | None = None
     capture_ended_ns: int | None = None
     capture_duration_us: int | None = None
+    visualization_schedule: LoopSchedule | None = None
+    count_in_started_ns: int | None = None
+    count_in_deadline_ns: int | None = None
     capture_events: list[MidiEvent] = field(default_factory=list)
     capture_truncated: bool = False
     cancel_reason: Literal["stop", "timeout"] | None = None
@@ -235,6 +245,120 @@ class CoachEngine:
             return (CoachPhase.IDLE,)
         return tuple(self._session.transitions)
 
+    def visualization_snapshot(self) -> CoachVisualizationSnapshot:
+        """Return one immutable internal highway sample on the owner thread."""
+
+        self._enter_owner()
+        sampled_at_ns = self._clock_ns()
+        session = self._session
+        if session is None:
+            return CoachVisualizationSnapshot(
+                active=False,
+                phase=CoachPhase.IDLE.value,
+                sampled_at_ns=sampled_at_ns,
+            )
+
+        phase = session.phase
+        active = phase not in {
+            CoachPhase.IDLE,
+            CoachPhase.READY,
+            CoachPhase.CANCELLED,
+            CoachPhase.FAILED,
+        }
+        resolution = session.resolution
+        timeline = session.timeline
+        base = {
+            "active": active,
+            "phase": phase.value,
+            "sampled_at_ns": sampled_at_ns,
+            "segment_label": timeline.segment_label if timeline is not None else None,
+            "tempo_percent": timeline.tempo_percent if timeline is not None else None,
+            "loop_count": session.loops if timeline is not None else 0,
+            "fidelity": (
+                resolution.lesson.provenance.fidelity.value if resolution is not None else None
+            ),
+            "practice_level": timeline.practice_level.value if timeline is not None else "full",
+            "required_note_count": (
+                sum(event.event_type == "note_on" and event.required for event in timeline.events)
+                if timeline is not None
+                else 0
+            ),
+            "ghost_note_count": (
+                sum(
+                    event.event_type == "note_on" and not event.required
+                    for event in timeline.events
+                )
+                if timeline is not None
+                else 0
+            ),
+        }
+        if not active:
+            return CoachVisualizationSnapshot(**base)
+        if phase in {
+            CoachPhase.RESOLVING,
+            CoachPhase.AUTHORING,
+            CoachPhase.SCORING,
+            CoachPhase.CANCELLING,
+        }:
+            return CoachVisualizationSnapshot(**base)
+        if phase is CoachPhase.REVIEW:
+            return CoachVisualizationSnapshot(
+                **base,
+                review=self._visualization_review_summary(),
+            )
+
+        schedule = (
+            session.playback_schedule
+            if phase is CoachPhase.DEMONSTRATING
+            else session.visualization_schedule
+        )
+        if schedule is None:
+            return CoachVisualizationSnapshot(**base)
+
+        anchor_ns: int | None = None
+        presentation_deadline_ns: int | None = None
+        count_in_remaining: int | None = None
+        if phase is CoachPhase.DEMONSTRATING:
+            anchor_ns = session.playback_anchor_ns
+            elapsed_us = self._elapsed_us(sampled_at_ns, anchor_ns)
+            cue_kind = "halcyon"
+        elif phase is CoachPhase.CAPTURING:
+            anchor_ns = session.capture_started_ns
+            elapsed_us = self._elapsed_us(sampled_at_ns, anchor_ns)
+            cue_kind = "target"
+        else:
+            elapsed_us = 0
+            cue_kind = "target"
+            if phase is CoachPhase.COUNT_IN:
+                anchor_ns = session.count_in_started_ns
+                presentation_deadline_ns = session.count_in_deadline_ns
+                count_in_remaining = self._count_in_remaining(session, sampled_at_ns)
+
+        projection = project_note_spans(
+            schedule,
+            elapsed_us=elapsed_us,
+            cue_kind=cue_kind,
+        )
+        if (
+            presentation_deadline_ns is None
+            and anchor_ns is not None
+            and projection.target_offset_us is not None
+        ):
+            presentation_deadline_ns = (
+                anchor_ns + (elapsed_us + projection.target_offset_us) * 1_000
+            )
+        return CoachVisualizationSnapshot(
+            **base,
+            presentation_anchor_ns=anchor_ns,
+            presentation_deadline_ns=presentation_deadline_ns,
+            spans=projection.spans,
+            current_loop=self._visualization_loop(schedule, elapsed_us),
+            target_notes=projection.target_notes,
+            target_offset_us=projection.target_offset_us,
+            count_in_remaining=count_in_remaining,
+            projection_error=projection.error,
+        )
+
     def teach(
         self,
         request: LessonRequest,
@@ -300,6 +424,7 @@ class CoachEngine:
         segment: str | None = None,
         tempo_percent: int | None = None,
         loops: int | None = None,
+        practice_level: PracticeLevel | str | None = None,
     ) -> PendingCommandOutcome:
         self._enter_owner()
         session, resolution = self._require_lesson()
@@ -311,6 +436,7 @@ class CoachEngine:
             resolution,
             segment=segment,
             tempo_percent=tempo_percent,
+            practice_level=practice_level,
         )
         session.timeline = timeline
         session.selection = selection
@@ -325,6 +451,7 @@ class CoachEngine:
         segment: str | None = None,
         tempo_percent: int | None = None,
         count_in: int | None = None,
+        practice_level: PracticeLevel | str | None = None,
     ) -> PendingCommandOutcome:
         self._enter_owner()
         session, resolution = self._require_lesson()
@@ -336,13 +463,14 @@ class CoachEngine:
             resolution,
             segment=segment,
             tempo_percent=tempo_percent,
+            practice_level=practice_level,
         )
         session.timeline = timeline
         session.selection = selection
         session.count_in = selected_count_in
-        session.capture_duration_us = resolve_loop_schedule(
-            resolution.lesson, timeline, 1
-        ).total_duration_us
+        practice_schedule = resolve_loop_schedule(resolution.lesson, timeline, 1)
+        session.visualization_schedule = practice_schedule
+        session.capture_duration_us = practice_schedule.total_duration_us
         operation = self._begin_operation(session, CoachPhase.COUNT_IN, "Preparing attempt")
         self._start_count_in(session)
         return self._pending(session, operation)
@@ -494,6 +622,7 @@ class CoachEngine:
             ),
             hand=Hand(arguments["hand"]) if arguments.get("hand") is not None else None,
             author=AuthorMode(arguments.get("author", "never")),
+            practice_level=PracticeLevel(arguments.get("practice_level", "full")),
         )
         return self.teach(request, loops=int(arguments.get("loops", 1)))
 
@@ -502,6 +631,7 @@ class CoachEngine:
             segment=arguments.get("segment"),
             tempo_percent=arguments.get("tempo_percent"),
             loops=arguments.get("loops"),
+            practice_level=arguments.get("practice_level"),
         )
 
     def coach_tool_start_attempt(self, **arguments: Any) -> PendingCommandOutcome:
@@ -509,6 +639,7 @@ class CoachEngine:
             segment=arguments.get("segment"),
             tempo_percent=arguments.get("tempo_percent"),
             count_in=arguments.get("count_in"),
+            practice_level=arguments.get("practice_level"),
         )
 
     def coach_tool_feedback(self, attempt_id: str | None = None) -> ImmediateCommandOutcome:
@@ -622,6 +753,7 @@ class CoachEngine:
                 tempo_percent=resolution.timeline.tempo_percent,
                 difficulty=resolution.timeline.difficulty,
                 hand=resolution.timeline.hand,
+                practice_level=resolution.timeline.practice_level,
             )
         )
         self._set_phase(session, CoachPhase.READY)
@@ -648,6 +780,7 @@ class CoachEngine:
         session.playback_id = f"playback-{uuid.uuid4().hex}"
         session.playback_purpose = purpose
         session.playback_schedule = schedule
+        session.visualization_schedule = schedule
         if purpose == "teach":
             session.capture_duration_us = schedule.boundaries_us[1]
         session.playback_index = 0
@@ -684,12 +817,13 @@ class CoachEngine:
                 deadline_ns = anchor_ns + scheduled.offset_us * 1_000
                 if deadline_ns > current_ns:
                     break
-                self._publish_playback_event(
-                    session,
-                    scheduled,
-                    deadline_ns,
-                    dispatched_ns=current_ns,
-                )
+                if scheduled.event.required:
+                    self._publish_playback_event(
+                        session,
+                        scheduled,
+                        deadline_ns,
+                        dispatched_ns=current_ns,
+                    )
                 session.playback_index += 1
                 receipt_state = self._poll_receipts(session)
                 if session.pending_failure is not None or receipt_state in {
@@ -785,7 +919,20 @@ class CoachEngine:
         session.playback_schedule = None
         session.playback_anchor_ns = None
         if session.playback_purpose == "teach":
-            self._start_count_in(session)
+            session.playback_purpose = None
+            session.visualization_schedule = None
+            session.capture_duration_us = None
+            session.count_in_started_ns = None
+            session.count_in_deadline_ns = None
+            session.capture_started_ns = None
+            session.capture_ended_ns = None
+            session.attempt_id = None
+            self._set_phase(session, CoachPhase.READY)
+            self._complete(
+                session,
+                code="COACH_TEACH_COMPLETE",
+                message="Lesson demonstration completed; use /coach attempt to practice.",
+            )
             return
         session.playback_purpose = None
         self._set_phase(session, CoachPhase.READY)
@@ -804,7 +951,10 @@ class CoachEngine:
         session.capture_truncated = False
         self._set_phase(session, CoachPhase.COUNT_IN)
         self._progress(session, "count_in", "Count-in started", 55)
+        started_ns = self._clock_ns()
+        session.count_in_started_ns = started_ns
         if session.count_in == 0:
+            session.count_in_deadline_ns = started_ns
             self._start_capture(session)
             return
         timeline = session.timeline
@@ -813,7 +963,7 @@ class CoachEngine:
             self._fail(session, self._runtime_error("NO_ACTIVE_LESSON", "No lesson is ready."))
             return
         deadline_ns = (
-            self._clock_ns()
+            started_ns
             + self._count_in_duration_us(
                 resolution,
                 timeline,
@@ -821,6 +971,7 @@ class CoachEngine:
             )
             * 1_000
         )
+        session.count_in_deadline_ns = deadline_ns
         self._arm_timing(session, deadline_ns, lambda: self._start_capture(session))
 
     def _start_capture(self, session: _CoachSession) -> None:
@@ -835,6 +986,8 @@ class CoachEngine:
         session.capture_events.clear()
         session.capture_truncated = False
         session.capture_started_ns = self._clock_ns()
+        session.count_in_started_ns = None
+        session.count_in_deadline_ns = None
         duration_us = session.capture_duration_us
         if duration_us is None:
             resolution = session.resolution
@@ -1396,18 +1549,21 @@ class CoachEngine:
         *,
         segment: str | None,
         tempo_percent: int | None,
+        practice_level: PracticeLevel | str | None,
     ) -> tuple[LessonTimeline, LessonSelection]:
         current = session.selection or LessonSelection(
             segment=resolution.timeline.segment_label,
             tempo_percent=resolution.timeline.tempo_percent,
             difficulty=resolution.timeline.difficulty,
             hand=resolution.timeline.hand,
+            practice_level=resolution.timeline.practice_level,
         )
         selection = LessonSelection(
             segment=current.segment if segment is None else segment,
             tempo_percent=current.tempo_percent if tempo_percent is None else tempo_percent,
             difficulty=current.difficulty,
             hand=current.hand,
+            practice_level=current.practice_level if practice_level is None else practice_level,
         )
         return resolve_timeline(resolution.lesson, selection), selection
 
@@ -1431,6 +1587,68 @@ class CoachEngine:
         numerator = tempo.microseconds_per_quarter * 4 * 100 * beats
         denominator = signature.denominator * timeline.tempo_percent
         return max(1, numerator // denominator)
+
+    @staticmethod
+    def _elapsed_us(sampled_at_ns: int, anchor_ns: int | None) -> int:
+        if anchor_ns is None:
+            return 0
+        return (sampled_at_ns - anchor_ns) // 1_000
+
+    @staticmethod
+    def _visualization_loop(schedule: LoopSchedule, elapsed_us: int) -> int:
+        return min(
+            max(0, bisect_right(schedule.boundaries_us, elapsed_us) - 1),
+            schedule.loops - 1,
+        )
+
+    @staticmethod
+    def _count_in_remaining(session: _CoachSession, sampled_at_ns: int) -> int | None:
+        started_ns = session.count_in_started_ns
+        deadline_ns = session.count_in_deadline_ns
+        if started_ns is None or deadline_ns is None or session.count_in <= 0:
+            return None
+        duration_ns = deadline_ns - started_ns
+        remaining_ns = max(0, deadline_ns - sampled_at_ns)
+        return max(
+            1,
+            min(
+                session.count_in,
+                (remaining_ns * session.count_in + duration_ns - 1) // duration_ns,
+            ),
+        )
+
+    def _visualization_review_summary(self) -> CoachReviewSummary | None:
+        if not self._reports:
+            return None
+        report = self._reports[-1]
+        metrics = report.get("metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+        tips_value = report.get("tips")
+        tips = (
+            tuple(tip[:300] for tip in tips_value if isinstance(tip, str))[:3]
+            if isinstance(tips_value, list)
+            else ()
+        )
+
+        def bounded_int(name: str) -> int | None:
+            value = metrics.get(name)
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        score = metrics.get("overall_score_percent")
+        overall_score = (
+            float(score)
+            if isinstance(score, (int, float)) and not isinstance(score, bool)
+            else None
+        )
+        status = report.get("status")
+        return CoachReviewSummary(
+            status=str(status)[:32] if isinstance(status, str) else "unknown",
+            overall_score_percent=overall_score,
+            matched_note_count=bounded_int("matched_note_count"),
+            expected_note_count=bounded_int("expected_note_count"),
+            tips=tips,
+        )
 
     def _state_public(self) -> dict[str, Any]:
         session = self._session
@@ -1456,6 +1674,20 @@ class CoachEngine:
             ),
             "segment": timeline.segment_label if timeline is not None else None,
             "tempo_percent": timeline.tempo_percent if timeline is not None else None,
+            "practice_level": timeline.practice_level.value if timeline is not None else "full",
+            "required_note_count": (
+                sum(event.event_type == "note_on" and event.required for event in timeline.events)
+                if timeline is not None
+                else 0
+            ),
+            "ghost_note_count": (
+                sum(
+                    event.event_type == "note_on" and not event.required
+                    for event in timeline.events
+                )
+                if timeline is not None
+                else 0
+            ),
             "loops": session.loops,
             "count_in": session.count_in,
             "playback_id": session.playback_id,

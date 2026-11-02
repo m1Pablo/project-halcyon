@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
-from dataclasses import dataclass, field
+from collections import OrderedDict
+from dataclasses import dataclass, field, replace
 import os
+import shlex
 import threading
 from typing import Any, Callable, ClassVar, Literal, TypeVar
+from uuid import uuid4
 
 from rich.text import Text
 from textual import constants as textual_constants
@@ -14,16 +16,15 @@ from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalScroll, Vertical
+from textual.message import Message
 from textual.widgets import Button, DataTable, Footer, Static
 from textual.worker import get_current_worker
 
 from halcyon.assistant import (
     HalcyonAssistant,
     local_tool_executor,
-    render_command_accepted,
-    render_command_progress,
-    render_command_terminal,
 )
+from halcyon.assistant_service import AssistantService
 from halcyon.audio_bridge import RustAudioBridge
 from halcyon.audio_viz import AudioVisualizationSnapshot
 from halcyon.chat_widgets import ChatPanel
@@ -33,9 +34,11 @@ from halcyon.coach_authoring import (
     OpenAILessonAuthoringProvider,
 )
 from halcyon.coach_engine import CoachEngine, ThreadingDeadlineScheduler
+from halcyon.coach_highway import CoachVisualizationSnapshot
+from halcyon.coach_highway_widget import CoachNoteHighway
+from halcyon.coach_models import CoachError
 from halcyon.coach_store import LessonStore
 from halcyon.command_executor import (
-    CommandProgress,
     CommandExecutionError,
     ImmediateCommandOutcome,
     PendingCommandOutcome,
@@ -44,6 +47,7 @@ from halcyon.command_executor import (
     prepare_slash_command,
 )
 from halcyon.controls import SynthRack
+from halcyon.console_events import CONSOLE_TERMINAL_STATES, ConsoleEvent, safe_console_text
 from halcyon.event_bus import (
     DispatchReceipt,
     MidiEventBus,
@@ -54,7 +58,7 @@ from halcyon.keyboard import keyboard_text, scroll_target_for_note
 from halcyon.logs import MidiEventLog
 from halcyon.menu import load_menu
 from halcyon.mcp_local import LocalControlServer
-from halcyon.mcp_local.run_tracker import RunTracker
+from halcyon.mcp_local.run_tracker import RunTracker, TERMINAL_RUN_STATES
 from halcyon.mcp_tools import ToolExecutionError
 from halcyon.midi import MidiEvent, MidiInput, MidiOrigin, MidiUnavailable
 from halcyon.oscillator_scope import OscillatorScope, ScopeMode
@@ -165,12 +169,12 @@ class _GlobalSafetyAction:
     reconnect_requested: bool
 
 
-@dataclass(slots=True)
-class _ChatPendingBinding:
-    operation_id: str
-    session_id: str
-    completion: Future[TerminalCommandOutcome]
-    unsubscribe: Callable[[], None]
+class _ConsoleEventMessage(Message):
+    """Thread-safe presentation delivery, with no execution authority."""
+
+    def __init__(self, event: ConsoleEvent) -> None:
+        super().__init__()
+        self.event = event
 
 
 @dataclass(slots=True, repr=False)
@@ -209,7 +213,7 @@ class HalcyonApp(App[None]):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("r", "reconnect", "Reconnect"),
         Binding("c", "clear_log", "Clear"),
-        Binding("comma", "toggle_settings", "Settings", priority=True),
+        Binding("comma", "toggle_settings", "Settings"),
         Binding("ctrl+s", "toggle_settings", "Settings", priority=True),
         Binding("f1", "workspace('stage')", "Stage", show=False),
         Binding("f2", "workspace('controls')", "Controls", show=False),
@@ -260,7 +264,7 @@ class HalcyonApp(App[None]):
         self._midi_source = "MIDI offline"
         self._size_class = ""
         self._workspace = "stage"
-        self._chat_pending_bindings: dict[tuple[str, str], _ChatPendingBinding] = {}
+        self._console_runs: OrderedDict[str, tuple[str, str, str | None]] = OrderedDict()
         self._owner_thread_id = threading.get_ident()
         self.event_bus = MidiEventBus()
         self._ui_bus_subscription = self.event_bus.subscribe(self._observe_dispatched_event)
@@ -279,6 +283,7 @@ class HalcyonApp(App[None]):
             dispatcher=self._dispatch_to_app,
             scheduler=ThreadingDeadlineScheduler(),
         )
+        self._coach_highway_active = False
         self.status = Static("Starting MIDI monitor...", id="status")
         self.audio_status = Static("Audio: starting Rust sidecar...", id="audio-status")
         self.status_rail = Static("HALCYON · starting", id="status-rail")
@@ -296,11 +301,33 @@ class HalcyonApp(App[None]):
             id="chat-panel",
         )
         self._run_tracker = RunTracker()
+        self._console_unsubscribe = self._run_tracker.subscribe(self._receive_console_event)
+        self._chat_assistant_session_id: str | None = None
+        self.assistant_service = AssistantService(
+            self.assistant,
+            self._run_tracker,
+            command=lambda command, parent, timeout: self._run_on_app_thread(
+                lambda: self.mcp_local_run_slash(
+                    command=command,
+                    source="llm",
+                    timeout_s=timeout,
+                    parent_run_id=parent,
+                    local_origin="assistant",
+                )
+            ),
+            state=lambda: self._run_on_app_thread(self._assistant_context),
+            event_sink=self._receive_console_event,
+        )
         self.local_control_server = LocalControlServer(self)
         self.keyboard = VirtualKeyboard(id="keyboard")
         self.keyboard_scroll = HorizontalScroll(id="keyboard-scroll")
         self.event_table = DataTable(id="event-log", zebra_stripes=True)
         self.scope = OscillatorScope(self.audio_visualization_snapshot, id="oscillator-scope")
+        self.coach_highway = CoachNoteHighway(
+            lambda: self.coach.visualization_snapshot(),
+            snapshot_consumer=self._present_coach_snapshot,
+            id="coach-highway",
+        )
 
     def compose(self) -> ComposeResult:
         with Vertical(id="app-shell"):
@@ -314,42 +341,53 @@ class HalcyonApp(App[None]):
                 yield Button("MIDI  F3", id="workspace-activity", compact=True)
                 yield Button("Console  F4", id="workspace-console", compact=True)
             with Vertical(id="workspace-host"):
-                with Horizontal(id="main-workspace"):
+                with Vertical(id="main-workspace"):
                     with Vertical(id="performance-stage", classes="workspace-pane"):
-                        with Horizontal(id="scope-toolbar"):
-                            yield Static("OSCILLATOR", classes="panel-title")
-                            yield Button("Wave", id="scope-wave", compact=True)
-                            yield Button("Orbit", id="scope-orbit", compact=True)
-                            yield Button("Radial", id="scope-radial", compact=True)
-                        yield self.scope
-                        yield Static(
-                            "PERFORMANCE · Akai LPK25 Wireless",
-                            id="keyboard-title",
-                            classes="panel-title",
-                        )
-                        yield Static(
-                            Text.assemble(
-                                ("● YOU", "bold #ff9f43"),
-                                "   ",
-                                ("◆ HALCYON", "bold #ab9df2"),
-                                "   ",
-                                ("●◆ BOTH", "bold #ffd866"),
-                                "   ",
-                                ("○ NEXT", "bold #78dce8"),
-                            ),
-                            id="keyboard-legend",
-                        )
-                        with self.keyboard_scroll:
-                            yield self.keyboard
-                    with Vertical(id="activity-panel", classes="workspace-pane"):
-                        yield Static("MIDI ACTIVITY", classes="panel-title")
-                        yield self.event_table
-                with Vertical(id="command-console", classes="workspace-pane"):
-                    yield Static(
-                        "COMMAND CONSOLE · Enter run · Shift+Enter newline · Tab complete",
-                        classes="panel-title",
-                    )
-                    yield self.chat_panel
+                        with Vertical(id="performance-header"):
+                            with Horizontal(id="scope-toolbar"):
+                                yield Static(
+                                    "PERFORMANCE · Akai LPK25 Wireless",
+                                    id="keyboard-title",
+                                    classes="panel-title",
+                                )
+                                yield Static(
+                                    "OSCILLATOR",
+                                    id="surface-mode-title",
+                                    classes="panel-title",
+                                )
+                                with Horizontal(id="scope-controls"):
+                                    yield Button("Wave", id="scope-wave", compact=True)
+                                    yield Button("Orbit", id="scope-orbit", compact=True)
+                                    yield Button("Radial", id="scope-radial", compact=True)
+                            yield Static(
+                                Text.assemble(
+                                    ("═ STRIKE", "bold #ffd866"),
+                                    "   ",
+                                    ("● YOU", "bold #ff9f43"),
+                                    "   ",
+                                    ("◆ HALCYON", "bold #fcfcfa"),
+                                    "   ",
+                                    ("○ EXPECTED", "bold #8b95a7"),
+                                    "   ",
+                                    ("●◆ BOTH", "bold #ffd866"),
+                                    "   ",
+                                    ("♮ NATURAL", "bold #ab9df2"),
+                                    "   ",
+                                    ("♯ SHARP", "bold #78dce8"),
+                                ),
+                                id="keyboard-legend",
+                            )
+                        with Vertical(id="instrument-surface"):
+                            yield self.scope
+                            yield self.coach_highway
+                            with self.keyboard_scroll:
+                                yield self.keyboard
+                    with Horizontal(id="lower-workspace"):
+                        with Vertical(id="command-console", classes="workspace-pane"):
+                            yield self.chat_panel
+                        with Vertical(id="activity-panel", classes="workspace-pane"):
+                            yield Static("MIDI ACTIVITY", classes="panel-title")
+                            yield self.event_table
         yield Footer()
 
     def on_mount(self) -> None:
@@ -372,6 +410,12 @@ class HalcyonApp(App[None]):
         self._apply_size_class(self.size.width, self.size.height)
         self.action_workspace("stage")
         self._refresh_scope_buttons()
+        self.watch(
+            self.keyboard_scroll,
+            "scroll_x",
+            self._sync_highway_viewport,
+            init=True,
+        )
         self._start_audio()
         self._start_local_control_server()
         self._connect_midi()
@@ -664,9 +708,7 @@ class HalcyonApp(App[None]):
     ) -> None:
         if action == "load":
             if enabled and not was_enabled:
-                self.chat_panel.write_system(
-                    "OpenAI credential loaded securely; natural-language routing is ready."
-                )
+                self.chat_panel.write_system("OpenAI credential loaded securely.")
             return
         if action == "save":
             if source is CredentialSource.ENVIRONMENT:
@@ -680,9 +722,7 @@ class HalcyonApp(App[None]):
                 )
                 self.chat_panel.write_system(message)
             else:
-                self.chat_panel.write_system(
-                    "OpenAI credential saved securely; natural-language routing is ready."
-                )
+                self.chat_panel.write_system("OpenAI credential saved securely.")
             return
         if enabled:
             self.chat_panel.write_system(
@@ -1051,6 +1091,8 @@ class HalcyonApp(App[None]):
         }
         if button_id in scope_modes:
             message.stop()
+            if self._coach_highway_active:
+                return
             self.scope.set_mode(scope_modes[button_id])
             self._refresh_scope_buttons()
 
@@ -1061,24 +1103,56 @@ class HalcyonApp(App[None]):
             button = self.query_one(f"#scope-{mode.value}", Button)
             button.set_class(self.scope.mode is mode, "selected")
 
+    def _present_coach_snapshot(self, snapshot: CoachVisualizationSnapshot) -> None:
+        """Present one read-only coach sample without influencing coach timing."""
+
+        active = snapshot.active
+        if active:
+            next_targets = set(snapshot.target_notes)
+        elif self._coach_highway_active:
+            next_targets = set()
+        else:
+            next_targets = self.target_notes
+        targets_changed = next_targets != self.target_notes
+        visibility_changed = active != self._coach_highway_active
+        self.target_notes = next_targets
+        self._coach_highway_active = active
+        if not self._is_mounted_now() or self._closing:
+            return
+        presentation_needs_sync = visibility_changed or self.coach_highway.display != active
+        if presentation_needs_sync:
+            self.query_one("#surface-mode-title", Static).update(
+                "COACH" if active else "OSCILLATOR"
+            )
+            self.query_one("#scope-controls", Horizontal).display = not active
+            self.scope.display = not active
+            self.coach_highway.display = active
+        if targets_changed or visibility_changed:
+            self._refresh_keyboard_state()
+        if targets_changed and next_targets:
+            self._scroll_keyboard_to(min(next_targets))
+
+    def _sync_highway_viewport(self, scroll_x: float) -> None:
+        """Mirror the keyboard's reactive cell scroll into the coach projection."""
+
+        self.coach_highway.set_viewport_origin(scroll_x)
+
     def on_unmount(self) -> None:
         """Release app-owned resources once at Textual's public exit boundary."""
         if self._resources_closed:
             return
         self._closing = True
         self._resources_closed = True
+        self._console_unsubscribe()
+        self._console_runs.clear()
+        self.assistant_service.close()
+        self.target_notes.clear()
+        self._coach_highway_active = False
         self._credential_generation += 1
         self._credential_busy = False
         self.workers.cancel_group(self, "openai-credential")
         with self._audio_state_lock:
             self._global_safety_action = None
-
-        for binding in tuple(self._chat_pending_bindings.values()):
-            try:
-                binding.unsubscribe()
-            except Exception:
-                pass
-        self._chat_pending_bindings.clear()
 
         try:
             self.coach.unmount()
@@ -1397,23 +1471,19 @@ class HalcyonApp(App[None]):
         self._refresh_status_rail()
 
     def on_chat_panel_submitted(self, message: ChatPanel.Submitted) -> None:
-        self.chat_panel.write_user(message.text)
         if message.text.startswith("/"):
             self._execute_chat_slash_command(message.text)
             return
         self._submit_natural_chat(message.text)
 
-    def _submit_natural_chat(self, text: str) -> None:
-        self.chat_panel.write_system("Routing")
-        thread = threading.Thread(
-            target=self._run_assistant,
-            args=(text,),
-            name="halcyon-assistant",
-            daemon=True,
-        )
-        thread.start()
+    def on_chat_panel_rerun_requested(self, message: ChatPanel.RerunRequested) -> None:
+        self._execute_chat_slash_command(message.command, local_origin="rerun")
 
-    def _execute_chat_slash_command(self, command: str) -> bool:
+    def _submit_natural_chat(self, text: str) -> None:
+        # Starting the shared service is immediate; only its worker calls the model.
+        self._run_assistant(text)
+
+    def _execute_chat_slash_command(self, command: str, *, local_origin: str = "chat") -> bool:
         resolved = resolve_slash_command(self.menu_def, command)
         if resolved.status == "group":
             choices = ", ".join(
@@ -1424,150 +1494,103 @@ class HalcyonApp(App[None]):
         if resolved.status == "error":
             self.chat_panel.write_system(resolved.message)
             return False
-
-        try:
-            outcome = execute_slash_command_outcome(
-                self,
-                self.menu_def,
-                command,
-                tool_executor=lambda _host, name, arguments: self._execute_tool_from_worker(
-                    name,
-                    arguments,
-                ),
+        code, payload = self.mcp_local_run_slash(
+            command=command, source="llm", local_origin=local_origin
+        )
+        if payload.get("deduplicated"):
+            self._receive_console_event(
+                ConsoleEvent(
+                    event_id=uuid4().hex,
+                    kind="log",
+                    role="user",
+                    source="You",
+                    text="Already running; using the existing run.",
+                    run_id=payload["run_id"],
+                    status=payload["status"],
+                )
             )
-        except (CommandExecutionError, ToolExecutionError, ValueError, TypeError) as exc:
-            self.chat_panel.write_system(f"Command failed: {exc}")
-            return False
-
-        if isinstance(outcome, PendingCommandOutcome):
-            self._bind_chat_pending(outcome)
-            return True
-        if resolved.leaf_command.lower().startswith("/coach "):
-            self.chat_panel.write_codex(render_command_terminal(outcome))
-        else:
-            result = outcome.to_public_dict()
-            self.chat_panel.write_codex(HalcyonApp._summarize_chat_command(command, result))
-        return True
-
-    @staticmethod
-    def _summarize_chat_command(command: str, result: dict[str, Any]) -> str:
-        if "error" in result:
-            error = result.get("error")
+        if "run_id" not in payload:
+            error = payload.get("error", "The command could not start.")
             if isinstance(error, dict):
-                message = str(error.get("message") or "Command failed.")[:500]
-                return f"{command}: {message}"
-            return f"{command}: Command failed."
-        return f"Ran `{command}`."
+                error = error.get("message", "The command could not start.")
+            self.chat_panel.write_system(self.assistant.safe_text(str(error)))
+        if payload.get("started") and payload.get("session_id"):
+            self._chat_assistant_session_id = payload["session_id"]
+        return code < 400
 
-    def _bind_chat_pending(
-        self,
-        pending: PendingCommandOutcome,
-    ) -> None:
-        self.chat_panel.write_codex(render_command_accepted(pending))
-
-        key = (pending.operation_id, pending.session_id)
-
-        def progress_callback(progress: CommandProgress) -> None:
-            self._post_live_callback(
-                lambda: self._render_chat_progress(
-                    pending.operation_id,
-                    pending.session_id,
-                    pending.completion,
-                    progress,
+    def _remember_console_run(self, run_id: str, command: str, local_origin: str | None) -> None:
+        safe = safe_console_text(self.assistant.safe_text(command, limit=8_000))
+        replay = (
+            command if safe == command and "\n" not in command and "\r" not in command else None
+        )
+        self._console_runs[run_id] = (safe, local_origin or "", replay)
+        self._console_runs.move_to_end(run_id)
+        while len(self._console_runs) > 1_000:
+            self._console_runs.popitem(last=False)
+        status = self._run_tracker.get_status(run_id)
+        if status is not None:
+            self._receive_console_event(
+                ConsoleEvent(
+                    event_id=f"private:{run_id}",
+                    kind="command",
+                    role="client",
+                    source=str(status["source"]),
+                    text=safe,
+                    run_id=run_id,
+                    parent_run_id=status.get("parent_run_id"),
+                    session_id=status.get("session_id"),
+                    operation_id=status.get("operation_id"),
+                    status=status["status"],
                 )
             )
 
-        def noop_unsubscribe() -> None:
-            return None
-
-        prior = self._chat_pending_bindings.pop(key, None)
-        if prior is not None:
-            try:
-                prior.unsubscribe()
-            except Exception:
-                pass
-        binding = _ChatPendingBinding(
-            operation_id=pending.operation_id,
-            session_id=pending.session_id,
-            completion=pending.completion,
-            unsubscribe=noop_unsubscribe,
-        )
-        self._chat_pending_bindings[key] = binding
-        try:
-            candidate_unsubscribe = pending.subscribe(progress_callback)
-        except Exception:
-            candidate_unsubscribe = None
-        if callable(candidate_unsubscribe) and self._chat_pending_bindings.get(key) is binding:
-            binding.unsubscribe = candidate_unsubscribe
-        pending.completion.add_done_callback(
-            lambda future: self._post_live_callback(
-                lambda: self._render_chat_terminal(
-                    pending.operation_id,
-                    pending.session_id,
-                    future,
-                )
-            )
-        )
-
-    def _render_chat_progress(
-        self,
-        operation_id: str,
-        session_id: str,
-        completion: Future[TerminalCommandOutcome],
-        progress: object,
-    ) -> None:
-        key = (operation_id, session_id)
-        binding = self._chat_pending_bindings.get(key)
-        if self._closing or binding is None or binding.completion is not completion:
-            return
-        if (
-            not isinstance(progress, CommandProgress)
-            or progress.operation_id != operation_id
-            or progress.session_id != session_id
-        ):
-            return
-        self.chat_panel.write_codex(render_command_progress(progress))
-
-    def _render_chat_terminal(
-        self,
-        operation_id: str,
-        session_id: str,
-        future: Future[object],
-    ) -> None:
-        key = (operation_id, session_id)
-        binding = self._chat_pending_bindings.get(key)
-        if self._closing or binding is None or future is not binding.completion:
-            return
-        try:
-            terminal = future.result()
-        except Exception:
-            terminal = None
-        popped = self._chat_pending_bindings.pop(key, None)
-        if popped is not binding:
-            return
-        try:
-            binding.unsubscribe()
-        except Exception:
-            pass
-        if (
-            not isinstance(terminal, TerminalCommandOutcome)
-            or terminal.operation_id != operation_id
-            or terminal.session_id != session_id
-        ):
-            self.chat_panel.write_codex(
-                "Coach failed [COACH_RESULT_INVALID]: "
-                "The coach returned an invalid terminal result."
-            )
-            return
-        self.chat_panel.write_codex(render_command_terminal(terminal))
-
-    def _post_live_callback(self, callback: Callable[[], None]) -> None:
+    def _receive_console_event(self, event: ConsoleEvent) -> None:
         if self._closing:
             return
-        try:
-            self._dispatch_to_app(callback)
-        except Exception:
+        if threading.get_ident() == self._owner_thread_id:
+            self._render_console_event(event)
+        else:
+            # Never block an observer on the UI: unsubscribe waits for callbacks.
+            self.post_message(_ConsoleEventMessage(event))
+
+    def on__console_event_message(self, message: _ConsoleEventMessage) -> None:
+        self._render_console_event(message.event)
+
+    def _render_console_event(self, event: ConsoleEvent) -> None:
+        if self._closing:
             return
+        if event.kind == "command" and event.run_id:
+            current = self._run_tracker.get_status(event.run_id)
+            if (
+                current is not None
+                and current["status"] in CONSOLE_TERMINAL_STATES
+                and event.status != current["status"]
+            ):
+                return
+        private = self._console_runs.get(event.run_id or "")
+        changes: dict[str, Any] = {
+            "text": self.assistant.safe_text(event.text, limit=8_000),
+            "raw_text": self.assistant.safe_text(event.raw_text, limit=8_000)
+            if event.raw_text is not None
+            else None,
+            "details": self.assistant.safe_text(event.details, limit=8_000)
+            if event.details is not None
+            else None,
+        }
+        if private is not None:
+            command, origin, replay = private
+            changes["local_origin"] = origin or None
+            if origin in {"chat", "rerun"}:
+                if event.kind == "message" and event.role == "assistant":
+                    changes["source"] = "Halcyon"
+                else:
+                    changes["source"] = "You" if origin == "chat" else "You · rerun"
+                    changes["role"] = "user"
+            elif origin == "assistant":
+                changes["source"] = "Assistant"
+            if event.kind == "command":
+                changes.update(text=command, raw_text=command, replay_command=replay)
+        self.chat_panel.append_event(replace(event, **changes))
 
     @staticmethod
     def _public_outcome_message(payload: dict[str, Any], *, fallback: str) -> str:
@@ -1622,7 +1645,15 @@ class HalcyonApp(App[None]):
         }
 
     def _assistant_context(self) -> dict[str, Any]:
-        return self.synth_tool_state()
+        library = getattr(self.lesson_service.store, "library", None)
+        try:
+            lessons = library() if callable(library) else []
+        except (CoachError, OSError):
+            lessons = []
+        return {
+            "lesson_library": lessons,
+            **self.synth_tool_state(),
+        }
 
     def synth_tool_set_param(self, param_id: str, normalized_value: float) -> dict[str, object]:
         dsp_patch = self.synth_rack.apply_patch({param_id: normalized_value}, emit=False)
@@ -1722,6 +1753,11 @@ class HalcyonApp(App[None]):
                 "running": server.port is not None,
             },
             "tracker": tracker.get_state(),
+            "assistant": {
+                "enabled": bool(getattr(getattr(self, "assistant", None), "enabled", False)),
+                "model": self.assistant.safe_text(self.assistant.model, limit=100),
+                "chat_session_id": getattr(self, "_chat_assistant_session_id", None),
+            },
             "synth": self.synth_tool_state(),
             "coach": coach_state,
         }
@@ -1732,8 +1768,15 @@ class HalcyonApp(App[None]):
         command: str,
         source: str,
         timeout_s: float | None = None,
+        parent_run_id: str | None = None,
+        local_origin: str | None = None,
     ) -> tuple[int, dict[str, Any]]:
-        clean_command = self._normalize_mcp_command(command)
+        if parent_run_id is not None:
+            parent = self._run_tracker.get_status(parent_run_id)
+            if self._closing or parent is None or parent["status"] in TERMINAL_RUN_STATES:
+                return 409, {"error": "The assistant request ended before command dispatch."}
+        # Preserve quoted arguments and multiline goals until the shared shlex parser.
+        clean_command = str(command or "").strip()
         source_key = self._normalize_mcp_source(source)
         if not clean_command.startswith("/"):
             return 400, {"error": "Slash command is required (must start with '/')."}
@@ -1742,6 +1785,27 @@ class HalcyonApp(App[None]):
             invocation = prepare_slash_command(self.menu_def, clean_command)
         except CommandExecutionError as exc:
             return 400, {"error": str(exc)}
+
+        if invocation.leaf_command in {"/coach stop", "/panic"}:
+            self.assistant_service.interrupt(except_run_id=parent_run_id)
+
+        if invocation.tool == "ask_assistant":
+            if parent_run_id is not None:
+                return 400, {"error": "Recursive assistant calls are not allowed."}
+            outcome = execute_slash_command_outcome(
+                self,
+                self.menu_def,
+                clean_command,
+                tool_executor=lambda _host, _name, arguments: self.assistant_service.start(
+                    **arguments, source=source_key
+                ),
+            )
+            payload = outcome.to_public_dict()
+            if payload.get("started"):
+                self._remember_console_run(payload["run_id"], command, local_origin)
+                payload.update(self._run_tracker.get_status(payload["run_id"]) or {})
+                payload = self._enrich_mcp_run_payload(payload)
+            return (202 if payload.get("started") else 409), payload
 
         policy = self._mcp_command_policy(
             clean_command,
@@ -1769,7 +1833,9 @@ class HalcyonApp(App[None]):
             command=self._public_tracker_command(clean_command, invocation.leaf_command),
             source=source_key,
             timeout_s=timeout_value,
+            parent_run_id=parent_run_id,
         )
+        self._remember_console_run(run_id, command, local_origin)
         self._run_tracker.mark_running(run_id)
         self._record_run_event(run_id, "INFO", f"Started {invocation.leaf_command}")
 
@@ -1835,6 +1901,13 @@ class HalcyonApp(App[None]):
             return None
         return self._enrich_mcp_run_payload(payload)
 
+    def mcp_local_wait_for_run(
+        self, run_id: str, *, cursor: int = 0, max_wait_s: float = 0.0
+    ) -> dict[str, Any] | None:
+        # LocalControlServer calls this directly from its HTTP worker, never the UI thread.
+        payload = self._run_tracker.wait_for_run(run_id, cursor=cursor, max_wait_s=max_wait_s)
+        return self._enrich_mcp_run_payload(payload) if payload is not None else None
+
     def audio_visualization_snapshot(self) -> AudioVisualizationSnapshot:
         """Return the latest raw waveform sample window for future UI widgets."""
 
@@ -1845,15 +1918,26 @@ class HalcyonApp(App[None]):
     ) -> dict[str, object]:
         return self._run_on_app_thread(lambda: local_tool_executor(self)(name, arguments))
 
-    def _run_assistant(self, message: str) -> None:
-        result = self.assistant.ask(message)
-        self._post_live_callback(lambda: self.chat_panel.write_assistant(result.text[:2000]))
-        if result.decision.action != "menu":
-            return
-        for command in result.decision.commands:
-            self._post_live_callback(
-                lambda command=command: self._execute_chat_slash_command(command)
+    def _run_assistant(
+        self, message: str, session_id: str | None = None, new_session: bool = False
+    ) -> None:
+        selected_session = session_id if new_session else self._chat_assistant_session_id
+        command = "/assistant ask " + shlex.quote(message)
+        if selected_session:
+            command += " --session-id " + selected_session
+        _code, started = self._run_on_app_thread(
+            lambda: self.mcp_local_run_slash(command=command, source="llm", local_origin="chat")
+        )
+        if not started.get("started"):
+            error = started.get("error", {})
+            text = (
+                error.get("message", "The assistant request could not start.")
+                if isinstance(error, dict)
+                else str(error)
             )
+            self.chat_panel.write_system(self.assistant.safe_text(text))
+            return
+        self._chat_assistant_session_id = started["session_id"]
 
     def _run_on_app_thread(self, callback: Callable[[], T]) -> T:
         if threading.get_ident() == getattr(self, "_owner_thread_id", threading.get_ident()):

@@ -29,6 +29,7 @@ from halcyon.coach_models import (
     resolve_loop_schedule,
     tick_positions_to_microseconds,
 )
+from halcyon.coach_practice import PracticeLevel
 
 NOW = "2026-07-12T00:00:00+00:00"
 
@@ -574,6 +575,41 @@ def test_scoring_handshake_types_can_be_constructed_directly() -> None:
 
     assert timeline.events == (resolved,)
     assert latency.tolerance_us == 60_000
+
+
+def test_practice_fields_are_runtime_only_and_default_to_exact_full_source() -> None:
+    lesson = make_lesson()
+    stored = lesson.to_dict()
+    request = LessonRequest("test")
+    selection = LessonSelection.from_request(request)
+    timeline = resolve_timeline(lesson, selection)
+
+    assert request.practice_level is selection.practice_level is PracticeLevel.FULL
+    assert timeline.practice_level is PracticeLevel.FULL
+    assert all(event.required for event in timeline.events)
+    assert lesson.to_dict() == stored
+    assert "practice_level" not in stored
+    assert all("required" not in event for event in stored["events"])
+    with pytest.raises(ValueError):
+        LessonRequest("test", practice_level="harder")
+    with pytest.raises(ValueError):
+        LessonSelection(practice_level="harder")
+    with pytest.raises(LessonValidationError, match="boolean"):
+        replace(timeline.events[0], required=1)
+
+
+def test_optional_note_roles_must_be_balanced_and_agree_on_release() -> None:
+    timeline = resolve_timeline(make_lesson())
+    onset, release = timeline.events
+    with pytest.raises(LessonValidationError, match="matching required roles"):
+        replace(timeline, events=(onset, replace(release, required=False)))
+    with pytest.raises(LessonValidationError, match="balanced"):
+        replace(timeline, events=(replace(onset, required=False),))
+    optional = replace(
+        timeline,
+        events=(replace(onset, required=False), replace(release, required=False)),
+    )
+    assert all(not event.required for event in optional.events)
 
 
 def test_loader_rejects_unknown_fields_and_newer_schema() -> None:

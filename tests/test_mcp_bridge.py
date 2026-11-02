@@ -16,6 +16,82 @@ from halcyon.mcp_bridge import (
 RUN_ID = "a" * 32
 
 
+@pytest.mark.parametrize(
+    "name, arguments, path",
+    [
+        ("ask_tui", {"goal": "help me practice", "session_id": "b" * 32, "max_wait_s": 0}, "/ask"),
+        ("wait_for_run", {"run_id": RUN_ID, "cursor": 2, "max_wait_s": 0}, "/wait_for_run"),
+    ],
+)
+def test_assistant_tools_forward_only_declared_control_payloads(name, arguments, path):
+    requests = []
+
+    def request_json(method, route, payload):
+        requests.append((method, route, payload))
+        return {"run_id": RUN_ID, "terminal": True, "result": {"reply": "Ready."}}
+
+    bridge = MCPBridge(api_url="http://127.0.0.1:8769", request_json=request_json)
+    result = bridge.handle_message(
+        {"id": 1, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+    )
+    assert requests[0][:2] == ("POST", path)
+    assert requests[0][2]["max_wait_s"] == 0
+    if name == "ask_tui":
+        assert requests[0][2]["goal"] == "help me practice"
+        assert requests[0][2]["source"] in {"llm", "codex", "claude", "debugger"}
+    assert not result["result"].get("isError")
+
+
+@pytest.mark.parametrize(
+    "name, args",
+    [
+        ("ask_tui", {"goal": ""}),
+        ("ask_tui", {"goal": "x" * 2001}),
+        ("ask_tui", {"goal": "help", "session_id": None}),
+        ("ask_tui", {"goal": "help", "source": "remote"}),
+        ("ask_tui", {"goal": "help", "max_wait_s": float("nan")}),
+        ("wait_for_run", {"run_id": RUN_ID, "cursor": True}),
+        ("wait_for_run", {"run_id": RUN_ID, "cursor": -1}),
+        ("wait_for_run", {"run_id": "../private"}),
+        ("wait_for_run", {"run_id": RUN_ID, "max_wait_s": 11}),
+    ],
+)
+def test_assistant_tools_reject_invalid_arguments_before_network(name, args):
+    calls = []
+    bridge = MCPBridge(
+        api_url="http://127.0.0.1:8769", request_json=lambda *args: calls.append(args)
+    )
+    response = bridge.handle_message(
+        {"id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}
+    )
+    assert response["result"]["isError"]
+    assert not calls
+
+
+def test_busy_assistant_keeps_only_safe_active_run_identity():
+    bridge = MCPBridge(
+        api_url="http://127.0.0.1:8769",
+        request_json=lambda *_args: {
+            "status_code": 409,
+            "error": {"code": "ASSISTANT_BUSY", "message": "private error"},
+            "active_run_id": RUN_ID,
+            "private_goal": "secret request",
+        },
+    )
+    response = bridge.handle_message(
+        {
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "ask_tui", "arguments": {"goal": "help"}},
+        }
+    )
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["active_run_id"] == RUN_ID
+    assert payload["started"] is False
+    assert "secret request" not in str(payload)
+    assert "private error" not in str(payload)
+
+
 def _tool_names(response: dict[str, object]) -> set[str]:
     result = response["result"]  # type: ignore[index]
     return {tool["name"] for tool in result["tools"]}  # type: ignore[index]
@@ -33,6 +109,8 @@ def test_bridge_lists_only_command_control_tools() -> None:
         "get_run_status",
         "get_run_logs",
         "get_app_state",
+        "ask_tui",
+        "wait_for_run",
     }
     tools = response["result"]["tools"]  # type: ignore[index]
     assert all(tool["inputSchema"]["additionalProperties"] is False for tool in tools)

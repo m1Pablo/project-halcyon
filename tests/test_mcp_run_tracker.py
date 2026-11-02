@@ -1216,3 +1216,514 @@ def test_explicit_mark_timeout_serializes_timed_out() -> None:
 
     assert tracker.mark_timeout(run_id)
     assert tracker.get_status(run_id)["status"] == "timed_out"  # type: ignore[index]
+
+
+def test_incremental_wait_cursors_survive_event_eviction():
+    tracker = RunTracker(max_events_per_run=2)
+    run, _ = tracker.create_run(command="/assistant ask", source="llm", session_id="a" * 32)
+    tracker.mark_running(run)
+    for number in range(3):
+        tracker.record_log_event({"run_id": run, "level": "INFO", "message": str(number)})
+    first = tracker.wait_for_run(run, cursor=0)
+    assert first["cursor_truncated"]
+    assert first["next_cursor"] == 3
+    assert [event["message"] for event in first["events"]] == ["1", "2"]
+    second = tracker.wait_for_run(run, cursor=3)
+    assert second["events"] == []
+    assert not second["terminal"]
+    tracker.mark_completed(
+        run, result={"reply": "x" * 2_000, "warnings": ["Check the failed child."]}
+    )
+    final = tracker.wait_for_run(run, cursor=3)
+    assert final["terminal"]
+    assert final["events"] == []
+    assert len(final["result"]["reply"]) == 2_000
+    assert final["verdict"]["needs_attention"]
+
+
+def test_child_run_exposes_parent_identity_without_goal_text():
+    tracker = RunTracker()
+    parent, _ = tracker.create_run(command="/assistant ask", source="llm")
+    child, _ = tracker.create_run(command="/synth set", source="llm", parent_run_id=parent)
+    assert tracker.get_status(child)["parent_run_id"] == parent
+
+
+def test_console_observers_receive_authoritative_lifecycle_and_pending_identity():
+    tracker = RunTracker()
+    events = []
+    tracker.subscribe(events.append)
+    parent, _ = tracker.create_run(
+        command="/assistant ask", source="llm", session_id="parent-session"
+    )
+    child, _ = tracker.create_run(command="/coach replay", source="llm", parent_run_id=parent)
+    pending = PendingHarness()
+    tracker.bind_pending(child, pending.outcome())
+    pending.progress()
+    pending.future.set_result(
+        TerminalCommandOutcome("operation-1", "session-1", "completed", {"ok": True})
+    )
+    child_events = [item for item in events if item.run_id == child]
+    assert [item.status for item in child_events if item.kind == "command"] == [
+        "queued",
+        "running",
+        "completed",
+    ]
+    assert all(item.parent_run_id == parent for item in child_events)
+    assert all(item.source == "llm" for item in child_events)
+    assert all(item.replay_command is None for item in child_events)
+    assert child_events[-1].operation_id == "operation-1"
+    assert child_events[-1].session_id == "session-1"
+    assert len({item.event_id for item in events}) == len(events)
+    before = list(events)
+    pending.progress("late")
+    assert events == before
+
+
+def test_console_observers_are_outside_lock_reentrant_and_exception_isolated():
+    tracker = RunTracker()
+    outside, seen = [], []
+
+    def observer(event):
+        acquired = threading.Event()
+
+        def probe():
+            with tracker._lock:
+                acquired.set()
+
+        thread = threading.Thread(target=probe, daemon=True)
+        thread.start()
+        outside.append(acquired.wait(timeout=1))
+        thread.join(timeout=1)
+        seen.append(event.status)
+        if event.status == "queued":
+            tracker.mark_running(event.run_id)
+        raise RuntimeError("observer failure")
+
+    tracker.subscribe(observer)
+    events = []
+    tracker.subscribe(events.append)
+    run_id, _ = tracker.create_run(command="/panic", source="codex")
+    assert tracker.mark_completed(run_id, success=True)
+    assert all(outside)
+    assert seen == ["queued", "running", "completed"]
+    assert [item.status for item in events] == seen
+    assert tracker.get_status(run_id)["status"] == "completed"
+
+
+def test_console_unsubscribe_is_idempotent_and_stops_already_queued_delivery():
+    tracker = RunTracker()
+    first, second = [], []
+
+    def observer(event):
+        first.append(event)
+        unsubscribe_second()
+
+    unsubscribe_first = tracker.subscribe(observer)
+    unsubscribe_second = tracker.subscribe(second.append)
+    run_id, _ = tracker.create_run(command="/panic", source="codex")
+    unsubscribe_first()
+    unsubscribe_first()
+    unsubscribe_second()
+    tracker.mark_completed(run_id)
+    assert len(first) == 1
+    assert second == []
+
+
+def test_console_notifications_are_bounded_without_changing_public_records():
+    tracker = RunTracker(max_events_per_run=2)
+    events = []
+    tracker.subscribe(events.append)
+    run_id, original = tracker.create_run(command="/coach replay", source="codex")
+    # Simulate a slow current callback while concurrent producers append diagnostics.
+    with tracker._lock:
+        tracker._console_notifying = True
+    for index in range(1_100):
+        tracker.record_log_event({"run_id": run_id, "message": str(index)})
+    assert len(tracker._console_notifications) == 1_000
+    with tracker._lock:
+        tracker._console_notifying = False
+    tracker.mark_completed(
+        run_id, result={"ok": True, "raw_attempt": [{"note": 60}], "safe": "sk-secret /tmp/file"}
+    )
+    assert events[-1].status == "completed"
+    assert "sk-secret" not in repr(events)
+    assert "/tmp/file" not in repr(events)
+    assert "raw_attempt" not in events[-1].details
+    public = tracker.get_logs(run_id)
+    assert len(public["events"]) == 2
+    assert original["status"] == "queued"
+    assert "console" not in repr(public)
+    assert "replay_command" not in repr(public)
+
+
+def test_concurrent_console_notifications_keep_each_run_order_and_allow_unsubscribe():
+    tracker = RunTracker()
+    events = []
+    unsubscribe = tracker.subscribe(events.append)
+
+    def execute():
+        run_id, _ = tracker.create_run(command="/panic", source="codex")
+        tracker.mark_running(run_id)
+        tracker.mark_completed(run_id)
+
+    threads = [threading.Thread(target=execute) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    unsubscribe()
+    assert len(events) == 48
+    for run_id in {item.run_id for item in events}:
+        assert [item.status for item in events if item.run_id == run_id] == [
+            "queued",
+            "running",
+            "completed",
+        ]
+
+
+def test_console_unsubscribe_waits_for_inflight_callback_and_prevents_later_calls():
+    tracker = RunTracker()
+    entered, release, detached = threading.Event(), threading.Event(), threading.Event()
+    seen = []
+
+    def observer(event):
+        seen.append(event)
+        entered.set()
+        release.wait(timeout=2)
+
+    unsubscribe = tracker.subscribe(observer)
+    producer = threading.Thread(target=lambda: tracker.create_run(command="/panic", source="codex"))
+    producer.start()
+    assert entered.wait(timeout=1)
+
+    def detach():
+        unsubscribe()
+        detached.set()
+
+    closer = threading.Thread(target=detach)
+    closer.start()
+    assert not detached.wait(timeout=0.02)
+    release.set()
+    producer.join(timeout=2)
+    closer.join(timeout=2)
+    assert detached.is_set()
+    tracker.mark_completed(seen[0].run_id)
+    assert len(seen) == 1
+
+
+def test_console_subscribe_does_not_replay_earlier_queued_events():
+    tracker = RunTracker()
+    old, new = [], []
+    tracker.subscribe(old.append)
+    with tracker._lock:
+        tracker._console_notifying = True
+    run_id, _ = tracker.create_run(command="/panic", source="codex")
+    tracker.subscribe(new.append)
+    with tracker._lock:
+        tracker._console_notifying = False
+    tracker.mark_completed(run_id)
+    assert [item.status for item in old] == ["queued", "completed"]
+    assert [item.status for item in new] == ["completed"]
+
+
+def test_console_pending_timeout_remains_running_until_authoritative_receipt():
+    tracker = RunTracker()
+    events = []
+    tracker.subscribe(events.append)
+    run_id, _ = tracker.create_run(command="/coach replay", source="codex")
+    pending = PendingHarness()
+    tracker.bind_pending(run_id, pending.outcome())
+    assert tracker.mark_timeout(run_id)
+    assert events[-1].status == "running"
+    assert not any(item.status == "timed_out" for item in events)
+    pending.future.set_result(
+        TerminalCommandOutcome("operation-1", "session-1", "cancelled", {"ok": False})
+    )
+    assert events[-1].status == "timed_out"
+    assert events[-1].severity == "error"
+    assert [item.status for item in events if item.kind == "command"] == [
+        "queued",
+        "running",
+        "timed_out",
+    ]
+
+
+def test_pending_tracker_ignores_malformed_progress_without_notifications():
+    tracker = RunTracker()
+    observed = []
+    tracker.subscribe(observed.append)
+    run_id, _ = tracker.create_run(command="/coach replay", source="codex")
+    pending = PendingHarness()
+    tracker.bind_pending(run_id, pending.outcome())
+    before = tracker.get_logs(run_id)
+    events_before = list(observed)
+    for malformed in (object(), None, {}, "progress"):
+        pending.subscribers[0](malformed)
+    assert tracker.get_logs(run_id) == before
+    assert observed == events_before
+    pending.progress()
+    assert observed[-1].kind == "log"
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_only_bound_pending_future_can_settle_or_fail_a_run(failure):
+    tracker = RunTracker()
+    observed = []
+    tracker.subscribe(observed.append)
+    run_id, _ = tracker.create_run(command="/coach replay", source="codex")
+    pending = PendingHarness()
+    tracker.bind_pending(run_id, pending.outcome())
+    forged = Future()
+    if failure:
+        forged.set_exception(RuntimeError("forged failure"))
+    else:
+        forged.set_result(
+            TerminalCommandOutcome("operation-1", "session-1", "completed", {"ok": True})
+        )
+    before = tracker.get_logs(run_id)
+    events_before = list(observed)
+    tracker._settle_pending(run_id, "operation-1", "session-1", forged)
+    # The authoritative Future also cannot block or settle early if invoked manually.
+    tracker._settle_pending(run_id, "operation-1", "session-1", pending.future)
+    assert tracker.get_logs(run_id) == before
+    assert observed == events_before
+    assert len(pending.subscribers) == 1
+    pending.future.set_result(
+        TerminalCommandOutcome("operation-1", "session-1", "completed", {"ok": True})
+    )
+    assert tracker.get_status(run_id)["status"] == "completed"
+    assert observed[-1].status == "completed"
+    assert pending.subscribers == []
+    assert tracker._runs[run_id].pending_completion is None
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_coach_console_preserves_safe_aggregate_without_widening_public_report(pending):
+    tracker = RunTracker()
+    observed = []
+    tracker.subscribe(observed.append)
+    run_id, _ = tracker.create_run(command="/coach feedback", source="codex")
+    result = {
+        "ok": True,
+        "message": "Scored.",
+        "report": {
+            "metrics": {"overall_score_percent": 87, "pitch_accuracy_percent": 90},
+            "tips": ["Slow the transition.", "sk-secret-tip /private/secret/lesson.json"],
+            "raw_events": ["PRIVATE_RAW_NOTE_STREAM"],
+            "artifact_path": "/private/private-attempt.json",
+        },
+    }
+    if pending:
+        operation = PendingHarness()
+        tracker.bind_pending(run_id, operation.outcome())
+        operation.future.set_result(
+            TerminalCommandOutcome("operation-1", "session-1", "completed", result)
+        )
+    else:
+        tracker.mark_completed(run_id, success=True, result=result)
+    details = observed[-1].details
+    assert "overall 87%" in details
+    assert "Slow the transition." in details
+    assert "PRIVATE_RAW_NOTE_STREAM" not in repr(observed)
+    assert "sk-secret-tip" not in repr(observed)
+    assert "/private/" not in repr(observed)
+    for public in (
+        tracker.get_status(run_id),
+        tracker.get_logs(run_id),
+        tracker.wait_for_run(run_id),
+    ):
+        assert "report" not in public["result"]
+        assert "overall 87%" not in repr(public)
+        assert "Slow the transition." not in repr(public)
+    assert "overall 87%" not in repr(tracker.get_state())
+    summaries = [item for item in observed if item.kind == "log" and "overall 87%" in item.text]
+    assert len(summaries) == 1
+    assert summaries[0].run_id == run_id
+    assert summaries[0].source == "codex"
+    assert summaries[0].status == "completed"
+    assert "Slow the transition." in summaries[0].text
+    if pending:
+        assert summaries[0].operation_id == "operation-1"
+        assert summaries[0].session_id == "session-1"
+        tracker._settle_pending(run_id, "operation-1", "session-1", operation.future)
+    else:
+        assert not tracker.mark_completed(run_id, success=True, result=result)
+    assert [
+        item for item in observed if item.kind == "log" and "overall 87%" in item.text
+    ] == summaries
+    assert not any("overall 87%" in event.get("message", "") for event in tracker._global_events)
+    assert tracker.get_logs(run_id)["events"] == []
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "timed_out"])
+def test_coach_console_error_projection_retains_authoritative_failure_status(status):
+    tracker = RunTracker()
+    observed = []
+    tracker.subscribe(observed.append)
+    run_id, _ = tracker.create_run(command="/coach replay", source="codex")
+    operation = PendingHarness()
+    tracker.bind_pending(run_id, operation.outcome())
+    operation.future.set_result(
+        TerminalCommandOutcome(
+            "operation-1",
+            "session-1",
+            status,
+            {
+                "ok": False,
+                "error": {"code": "SAFE_ERROR", "message": "Retry sk-private /tmp/lesson"},
+            },
+        )
+    )
+    assert observed[-1].status == status
+    assert "Coach complete" not in observed[-1].details
+    assert "sk-private" not in repr(observed)
+    assert "/tmp/lesson" not in repr(observed)
+    if status == "timed_out":
+        assert "timed out" in observed[-1].details
+
+
+def test_coach_console_never_projects_success_from_failed_inconsistent_payload():
+    tracker = RunTracker()
+    observed = []
+    tracker.subscribe(observed.append)
+    run_id, _ = tracker.create_run(command="/coach feedback", source="codex")
+    tracker.mark_completed(run_id, success=False, result={"ok": True, "message": "SUCCESS_TEXT"})
+    assert observed[-1].status == "failed"
+    assert "Coach complete" not in observed[-1].details
+
+
+@pytest.fixture
+def practice_report_payload():
+    content_id = "b" * 64
+    return {
+        "schema_version": 1,
+        "attempt_id": "attempt-practice",
+        "session_id": "session-practice",
+        "status": "complete",
+        "lesson": {
+            "lesson_id": "practice-boundary",
+            "revision_id": derive_revision_id(content_id),
+            "content_id": content_id,
+            "segment_label": "main",
+            "tempo_percent": 25,
+        },
+        "metrics": {
+            "scoring_version": "halcyon-score-v1",
+            "expected_note_count": 1,
+            "observed_note_count": 1,
+            "matched_note_count": 1,
+            "pitch_accuracy_percent": 100.0,
+            "missed_count": 0,
+            "wrong_pitch_count": 0,
+            "extra_count": 0,
+            "onset_mean_deviation_ms": 0.0,
+            "onset_p95_deviation_ms": 0.0,
+            "held_duration_mean_deviation_ms": 0.0,
+            "completion_percent": 100.0,
+            "overall_score_percent": 100.0,
+            "truncated": False,
+            "tolerances_ms": {"onset": 45.0, "duration": 90.0},
+            "weights_percent": {"pitch": 45, "onset": 25, "duration": 15, "completion": 15},
+        },
+        "latency": {
+            "source": "default",
+            "offset_ms": 0.0,
+            "jitter_ms": 0.0,
+            "onset_tolerance_ms": 45.0,
+            "match_count": 1,
+        },
+        "issues": [],
+        "tips": [],
+        "recommendation": {
+            "action": "repeat_segment",
+            "tempo_percent": 25,
+            "segment_label": "main",
+            "loops": 1,
+            "focus": "Repeat the required notes.",
+        },
+    }
+
+
+def tracked_practice_report_surfaces(report):
+    tracker = RunTracker()
+    run_id, _ = tracker.create_run(command="/coach feedback", source="codex")
+    pending = PendingHarness()
+    base = pending.outcome()
+    payload = {"report": report}
+    assert tracker.bind_pending(
+        run_id,
+        PendingCommandOutcome(
+            base.operation_id,
+            base.session_id,
+            payload,
+            base.completion,
+            base.cancel_callback,
+            base.subscribe_callback,
+        ),
+    )
+    tracker.record_log_event({"run_id": run_id, "message": "report", "nested": payload})
+    accepted = tracker.get_status(run_id)["accepted"]
+    logged = tracker.get_logs(run_id)["events"][-1]["nested"]
+    pending.future.set_result(
+        TerminalCommandOutcome("operation-1", "session-1", "completed", payload)
+    )
+    return accepted, logged, tracker.get_status(run_id)["result"]
+
+
+@pytest.mark.parametrize("level", ("melody", "essentials", "full"))
+@pytest.mark.parametrize("ghost_count", (0, 175, 2_048))
+def test_report_preserves_only_valid_practice_aggregates(
+    practice_report_payload, level, ghost_count
+):
+    report = practice_report_payload
+    report["lesson"].update(practice_level=level, ghost_note_count=ghost_count)
+    expected_lesson = deepcopy(report["lesson"])
+    report["lesson"]["ornament_notes"] = "HOSTILE-PRACTICE-MARKER"
+    report["lesson"]["practiceLevel"] = "HOSTILE-PRACTICE-MARKER"
+
+    for result in tracked_practice_report_surfaces(report):
+        assert result["report"]["lesson"] == expected_lesson
+        assert "HOSTILE-PRACTICE-MARKER" not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "optional_fields", ({}, {"practice_level": "melody"}, {"ghost_note_count": 0})
+)
+def test_legacy_report_does_not_require_or_invent_optional_practice_fields(
+    practice_report_payload, optional_fields
+):
+    report = practice_report_payload
+    report["lesson"].update(optional_fields)
+
+    for result in tracked_practice_report_surfaces(report):
+        assert result["report"] == report
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("practice_level", "beginner"),
+        ("practice_level", "MELODY"),
+        ("practice_level", ""),
+        ("practice_level", None),
+        ("practice_level", True),
+        ("practice_level", 1),
+        ("practice_level", ["melody"]),
+        ("ghost_note_count", -1),
+        ("ghost_note_count", 2_049),
+        ("ghost_note_count", True),
+        ("ghost_note_count", False),
+        ("ghost_note_count", 1.0),
+        ("ghost_note_count", "1"),
+        ("ghost_note_count", None),
+        ("ghost_note_count", []),
+    ),
+)
+def test_invalid_practice_aggregate_rejects_entire_report(practice_report_payload, field, value):
+    report = practice_report_payload
+    report["lesson"].update(practice_level="melody", ghost_note_count=0)
+    report["lesson"][field] = value
+
+    for result in tracked_practice_report_surfaces(report):
+        assert "report" not in result

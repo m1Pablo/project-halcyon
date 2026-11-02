@@ -12,6 +12,8 @@ import re
 from typing import Any, Iterable, Literal, Mapping, Sequence
 import unicodedata
 
+from halcyon.coach_practice import PracticeLevel, practice_required_event_ids
+
 LESSON_SCHEMA_VERSION = 1
 LATENCY_SCHEMA_VERSION = 1
 MAX_STORED_EVENTS = 2_048
@@ -483,6 +485,7 @@ class LessonRequest:
     difficulty: Difficulty | None = None
     hand: Hand | None = None
     author: AuthorMode = AuthorMode.NEVER
+    practice_level: PracticeLevel = PracticeLevel.FULL
 
     def __post_init__(self) -> None:
         query = re.sub(r"\s+", " ", self.query.strip())
@@ -500,6 +503,7 @@ class LessonRequest:
         if self.hand is not None:
             object.__setattr__(self, "hand", Hand(self.hand))
         object.__setattr__(self, "author", AuthorMode(self.author))
+        object.__setattr__(self, "practice_level", PracticeLevel(self.practice_level))
 
     @property
     def normalized_alias(self) -> str:
@@ -512,6 +516,7 @@ class LessonSelection:
     tempo_percent: int = 100
     difficulty: Difficulty | None = None
     hand: Hand | None = None
+    practice_level: PracticeLevel = PracticeLevel.FULL
 
     def __post_init__(self) -> None:
         _require_int_range(
@@ -523,6 +528,7 @@ class LessonSelection:
             object.__setattr__(self, "difficulty", Difficulty(self.difficulty))
         if self.hand is not None:
             object.__setattr__(self, "hand", Hand(self.hand))
+        object.__setattr__(self, "practice_level", PracticeLevel(self.practice_level))
 
     @classmethod
     def from_request(cls, request: LessonRequest) -> LessonSelection:
@@ -531,6 +537,7 @@ class LessonSelection:
             tempo_percent=request.tempo_percent,
             difficulty=request.difficulty,
             hand=request.hand,
+            practice_level=request.practice_level,
         )
 
 
@@ -548,8 +555,11 @@ class ResolvedLessonEvent:
     delta_tick: int
     absolute_us: int
     delta_us: int
+    required: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.required, bool):
+            raise LessonValidationError("required must be a boolean", field="required")
         _require_text(self.lesson_event_id, "lesson_event_id", 128)
         if self.event_type not in {"note_on", "note_off"}:
             raise LessonValidationError(
@@ -593,8 +603,10 @@ class LessonTimeline:
     duration_ticks: int
     duration_us: int
     events: tuple[ResolvedLessonEvent, ...]
+    practice_level: PracticeLevel = PracticeLevel.FULL
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "practice_level", PracticeLevel(self.practice_level))
         _validate_identifier(self.lesson_id, "lesson_id")
         _require_text(self.revision_id, "revision_id", 80)
         if not re.fullmatch(r"[0-9a-f]{64}", self.content_id):
@@ -640,6 +652,22 @@ class LessonTimeline:
                     "resolved event exceeds timeline duration", field=f"events[{index}]"
                 )
             previous_tick, previous_us = event.absolute_tick, event.absolute_us
+        if self.practice_level is not PracticeLevel.FULL or any(
+            not event.required for event in self.events
+        ):
+            active: dict[tuple[int, int], deque[bool]] = defaultdict(deque)
+            for event in self.events:
+                key = (event.channel, event.note)
+                if event.event_type == "note_on":
+                    active[key].append(event.required)
+                elif not active[key] or active[key].popleft() != event.required:
+                    raise LessonValidationError(
+                        "practice note pairs must have matching required roles", field="required"
+                    )
+            if any(active.values()):
+                raise LessonValidationError(
+                    "practice note pairs must be balanced", field="required"
+                )
 
 
 @dataclass(frozen=True)
@@ -1029,6 +1057,7 @@ def resolve_timeline(
     if isinstance(selection, LessonRequest):
         selection = LessonSelection.from_request(selection)
     selection = selection or LessonSelection()
+    required_event_ids = practice_required_event_ids(lesson, selection.practice_level)
     segment = _select_segment(lesson, selection)
     start_tick = segment.start_tick if segment else 0
     end_tick = segment.end_tick if segment else lesson.duration_ticks
@@ -1062,10 +1091,20 @@ def resolve_timeline(
                 delta_tick=relative_tick - previous_tick,
                 absolute_us=absolute_us,
                 delta_us=absolute_us - previous_us,
+                required=event.event_id.split(":segment-", 1)[0] in required_event_ids,
             )
         )
         previous_tick, previous_us = relative_tick, absolute_us
     duration_ticks = end_tick - start_tick
+    if selection.practice_level is not PracticeLevel.FULL and not any(
+        event.event_type == "note_on" and event.required for event in resolved_events
+    ):
+        raise CoachError(
+            "PRACTICE_UNAVAILABLE",
+            "This segment has no required notes in the selected practice layer.",
+            field="practice",
+            resolution="Choose another segment or retry with --practice essentials or full.",
+        )
     resolved_hand = selection.hand or ((segment.hand or lesson.hand) if segment else lesson.hand)
     resolved_difficulty = selection.difficulty or (
         (segment.difficulty or lesson.difficulty) if segment else lesson.difficulty
@@ -1084,6 +1123,7 @@ def resolve_timeline(
         duration_ticks=duration_ticks,
         duration_us=lesson_us[end_tick] - start_us,
         events=tuple(resolved_events),
+        practice_level=selection.practice_level,
     )
 
 
