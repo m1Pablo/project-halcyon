@@ -26,6 +26,10 @@ _MAX_BRIDGE_TIMEOUT_S = 60.0
 _ALLOWED_SOURCES = frozenset({"codex", "claude", "llm", "debugger"})
 _RUN_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 _KNOWN_UPSTREAM_ERRORS = {
+    "ASSISTANT_BUSY": "An assistant request is still active. Wait for its run. Use /coach stop or /panic for immediate audio control.",
+    "ASSISTANT_CLOSED": "The app is closing.",
+    "SESSION_NOT_FOUND": "Sessions live in memory. Omit session_id to start a new conversation.",
+    "INVALID_GOAL": "Use a goal of 1 through 2000 characters.",
     "INVALID_ARGUMENTS": "Request contains unsupported arguments.",
     "INVALID_COMMAND": "command is invalid.",
     "INVALID_JSON_BODY": "Request body must be a JSON object.",
@@ -173,6 +177,7 @@ class MCPBridge:
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "halcyon-local", "version": "0.1.0"},
+                    "instructions": "Use ask_tui for musical questions or multi-step goals handled by Halcyon's own assistant. Use run_slash_command for one explicit command. Continue conversations with the returned session_id. While terminal=false, use wait_for_run with next_cursor; never resubmit a running goal. Inspect verdict and result, not just run status. The assistant cannot hear audio or import files.",
                 },
             )
         if method == "ping":
@@ -202,6 +207,34 @@ class MCPBridge:
 
     def _tools(self) -> list[dict[str, Any]]:
         return [
+            {
+                "name": "ask_tui",
+                "description": "Ask Halcyon's shared music/synth/coach assistant a question or delegate a goal. Returns run_id, session_id, terminal, incremental events and, when finished, result.reply and verdict. Pass session_id for follow-ups. Do not resubmit running goals; use wait_for_run.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "goal": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "session_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                        "max_wait_s": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
+                    },
+                    "required": ["goal"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "wait_for_run",
+                "description": "Wait up to 10 seconds for a command or assistant run. Pass its run_id and previous next_cursor (initially 0). Returns terminal, new events, next_cursor, result and verdict. Continue waiting until terminal; relay warnings and failures.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$"},
+                        "cursor": {"type": "integer", "minimum": 0, "default": 0},
+                        "max_wait_s": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": False,
+                },
+            },
             {
                 "name": "list_commands",
                 "description": "List available Halcyon slash commands from menu.xml.",
@@ -244,7 +277,7 @@ class MCPBridge:
             },
             {
                 "name": "get_run_status",
-                "description": "Get status for a Halcyon slash-command run_id.",
+                "description": "Get status for a Halcyon command or assistant run_id.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -261,7 +294,7 @@ class MCPBridge:
             },
             {
                 "name": "get_run_logs",
-                "description": "Fetch structured logs for a Halcyon slash-command run_id.",
+                "description": "Fetch structured logs for a Halcyon command or assistant run_id.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -289,6 +322,55 @@ class MCPBridge:
         ]
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if name in {"ask_tui", "wait_for_run"}:
+            allowed = (
+                {"goal", "session_id", "max_wait_s"}
+                if name == "ask_tui"
+                else {"run_id", "cursor", "max_wait_s"}
+            )
+            wait = arguments.get("max_wait_s", 1.0)
+            if (
+                not set(arguments).issubset(allowed)
+                or isinstance(wait, bool)
+                or not isinstance(wait, (int, float))
+                or not math.isfinite(wait)
+                or not 0 <= wait <= 10
+            ):
+                return self._invalid_arguments()
+            # Leave headroom below the bridge's configured HTTP timeout.
+            body = {**arguments, "max_wait_s": min(float(wait), max(0.0, self._timeout_s - 1.0))}
+            if name == "ask_tui":
+                goal = arguments.get("goal")
+                session = arguments.get("session_id")
+                if (
+                    not isinstance(goal, str)
+                    or not goal.strip()
+                    or len(goal) > 2_000
+                    or (
+                        "session_id" in arguments
+                        and (
+                            not isinstance(session, str)
+                            or not re.fullmatch(r"[0-9a-f]{32}", session)
+                        )
+                    )
+                ):
+                    return self._invalid_arguments()
+                body["source"] = self._default_source
+                path = "/ask"
+            else:
+                run_id = arguments.get("run_id")
+                cursor = arguments.get("cursor", 0)
+                if (
+                    not isinstance(run_id, str)
+                    or not _RUN_ID_RE.fullmatch(run_id)
+                    or isinstance(cursor, bool)
+                    or not isinstance(cursor, int)
+                    or not 0 <= cursor <= 2**53
+                ):
+                    return self._invalid_arguments()
+                body["run_id"] = run_id.lower()
+                path = "/wait_for_run"
+            return self._tool_response(self._request("POST", path, body))
         if name == "list_commands":
             if arguments:
                 return self._invalid_arguments()
@@ -551,7 +633,15 @@ def _sanitize_upstream_error(payload: dict[str, Any]) -> dict[str, Any]:
         code = str(error_payload.get("code", ""))
         message = _KNOWN_UPSTREAM_ERRORS.get(code)
         if message is not None:
-            return _fixed_error(code, message, status_code=max(400, status_code))
+            result = _fixed_error(code, message, status_code=max(400, status_code))
+            active_id = payload.get("active_run_id")
+            if (
+                code == "ASSISTANT_BUSY"
+                and isinstance(active_id, str)
+                and _RUN_ID_RE.fullmatch(active_id)
+            ):
+                result.update(started=False, active_run_id=active_id)
+            return result
 
     return _fixed_error(
         "LOCAL_CONTROL_REQUEST_FAILED",

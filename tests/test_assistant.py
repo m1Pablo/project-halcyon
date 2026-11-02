@@ -1,11 +1,8 @@
-import json
 from concurrent.futures import Future
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-import halcyon.assistant as assistant_module
 from halcyon.assistant import (
-    MAX_ASSISTANT_HISTORY_ENTRIES,
-    MAX_ASSISTANT_HISTORY_TEXT,
     MAX_ASSISTANT_OPERATION_TEXT,
     DISABLED_MESSAGE,
     HalcyonAssistant,
@@ -14,90 +11,65 @@ from halcyon.assistant import (
     render_command_progress,
     render_command_terminal,
 )
-from halcyon.chat_router import MISSING_KEY_REASON, RoutingDecision
 from halcyon.command_executor import CommandProgress, PendingCommandOutcome, TerminalCommandOutcome
 from halcyon.menu import load_menu
 
-_LLM = "halcyon.chat_router._call_router_llm"
-
 
 def test_openai_tool_definitions_expose_no_raw_synth_tools() -> None:
-    assert openai_tool_definitions() == []
-
-
-def test_assistant_returns_routing_decision_from_mocked_openai() -> None:
-    payload = {
-        "action": "menu",
-        "stages": [["/synth patch tone=0.85 release=0.05"]],
-        "reason": "brighter and shorter",
+    assert {tool["name"] for tool in openai_tool_definitions()} == {
+        "get_app_state",
+        "run_slash_command",
     }
-    llm = MagicMock(return_value=json.dumps(payload))
-    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=object())
 
-    with patch(_LLM, llm):
-        result = assistant.ask("make it brighter and shorter")
 
-    assert result.text == "Routing to `/synth patch tone=0.85 release=0.05`."
-    assert result.decision.commands == ("/synth patch tone=0.85 release=0.05",)
+def test_assistant_answers_questions_without_changing_state() -> None:
+    client = MagicMock()
+    client.responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], output_text="Try a slower tempo."
+    )
+    control = MagicMock()
+    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=client)
+    result = assistant.ask("how should I practice?", control=control)
+    assert result.text == "Try a slower tempo."
     assert result.tool_results == []
     assert result.enabled
+    control.assert_not_called()
 
 
-def test_assistant_passes_live_context_to_router_prompt() -> None:
-    payload = {
-        "action": "menu",
-        "stages": [["/preset save Deep Time"]],
-        "reason": "save current patch",
-    }
-    llm = MagicMock(return_value=json.dumps(payload))
+def test_assistant_passes_live_context_to_agent() -> None:
+    client = MagicMock()
+    client.responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], output_text="The current tone is dark."
+    )
     assistant = HalcyonAssistant(
         menu_def=load_menu(),
         api_key="sk-test",
-        client=object(),
+        client=client,
         context_provider=lambda: {
             "patch": {"preset": None, "params": [{"id": "tone", "normalized": 0.22}]},
             "presets": {"built_in": ["Init"], "user": []},
         },
     )
 
-    with patch(_LLM, llm):
-        result = assistant.ask("save this preset as Deep Time")
-
-    prompt = llm.call_args.args[0]
-    assert '"normalized":0.22' in prompt
-    assert '"user":[]' in prompt
-    assert result.decision.commands == ("/preset save Deep Time",)
+    assistant.ask("how dark is this?", control=MagicMock())
+    prompt = client.responses.create.call_args.kwargs["instructions"]
+    assert '"normalized": 0.22' in prompt
+    assert '"user": []' in prompt
 
 
-def test_assistant_passes_recent_chat_context_to_router_prompt() -> None:
-    llm = MagicMock(
-        side_effect=[
-            json.dumps(
-                {
-                    "action": "menu",
-                    "stages": [["/synth patch tone=0.34 release=0.58"]],
-                    "reason": "initial patch",
-                }
-            ),
-            json.dumps(
-                {
-                    "action": "menu",
-                    "stages": [["/synth set tone 0.22"]],
-                    "reason": "relative adjustment",
-                }
-            ),
-        ]
+def test_assistant_passes_caller_owned_session_history() -> None:
+    client = MagicMock()
+    client.responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], output_text="Darker."
     )
-    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=object())
-
-    with patch(_LLM, llm):
-        assistant.ask("make a Deep Time patch")
-        result = assistant.ask("make it darker")
-
-    second_prompt = llm.call_args_list[1].args[0]
-    assert "make a Deep Time patch" in second_prompt
-    assert "/synth patch tone=0.34 release=0.58" in second_prompt
-    assert result.decision.commands == ("/synth set tone 0.22",)
+    assistant = HalcyonAssistant(api_key="sk-test", client=client)
+    history = [
+        {"role": "user", "content": "make a Deep Time patch"},
+        {"role": "assistant", "content": "Set tone to .34. Completed."},
+    ]
+    assistant.ask("make it darker", control=MagicMock(), history=history)
+    inputs = client.responses.create.call_args.kwargs["input"]
+    assert inputs[:2] == history
 
 
 def test_assistant_missing_key_is_deterministic(monkeypatch) -> None:
@@ -105,11 +77,10 @@ def test_assistant_missing_key_is_deterministic(monkeypatch) -> None:
 
     assistant = HalcyonAssistant(menu_def=load_menu())
 
-    result = assistant.ask("do the subtle thing and also another subtle thing")
+    result = assistant.ask("do the subtle thing and also another subtle thing", control=MagicMock())
 
-    assert result.text == MISSING_KEY_REASON
     assert result.text == DISABLED_MESSAGE
-    assert result.decision.action == "reject"
+    assert result.stopped_reason == "missing_key"
     assert not result.enabled
 
 
@@ -117,39 +88,20 @@ def test_assistant_natural_language_requires_openai_key(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assistant = HalcyonAssistant(menu_def=load_menu())
 
-    result = assistant.ask("all notes off")
+    result = assistant.ask("all notes off", control=MagicMock())
 
-    assert result.text == MISSING_KEY_REASON
-    assert result.decision.action == "reject"
+    assert result.text == DISABLED_MESSAGE
     assert not result.enabled
 
 
-def test_assistant_reconfigures_key_live_without_losing_history(monkeypatch) -> None:
+def test_assistant_reconfigures_key_live(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    calls: list[tuple[str | None, list[dict[str, str]]]] = []
-
-    def route(_message: str, **kwargs: object) -> RoutingDecision:
-        calls.append(
-            (
-                kwargs.get("api_key") if isinstance(kwargs.get("api_key"), str) else None,
-                list(kwargs.get("chat_context", [])),  # type: ignore[arg-type]
-            )
-        )
-        return RoutingDecision(action="reject", reason="test")
-
-    monkeypatch.setattr(assistant_module, "run_chat_routing", route)
     assistant = HalcyonAssistant(menu_def=load_menu())
     assert not assistant.enabled
 
     assistant.set_api_key("  stored-key-one  ")
     assert assistant.enabled
-    assistant.ask("first request")
     assistant.set_api_key("stored-key-two")
-    assistant.ask("second request")
-
-    assert calls[0] == ("stored-key-one", [])
-    assert calls[1][0] == "stored-key-two"
-    assert any(item["content"] == "first request" for item in calls[1][1])
 
     assistant.set_api_key("   ")
     assert not assistant.enabled
@@ -292,43 +244,28 @@ def test_assistant_terminal_renderer_surfaces_only_bounded_source_resolution() -
     assert len(rendered) <= MAX_ASSISTANT_OPERATION_TEXT
 
 
-def test_assistant_bounds_retained_history_and_decision_text() -> None:
-    llm = MagicMock(
-        return_value=json.dumps({"action": "reject", "stages": [], "reason": "outside app"})
+def test_assistant_bounds_reply_and_scrubs_nonstandard_key() -> None:
+    client = MagicMock()
+    client.responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], output_text="private-key-value " + "x" * 10_000
     )
-    assistant = HalcyonAssistant(menu_def=load_menu(), api_key="sk-test", client=object())
-
-    with patch(_LLM, llm):
-        for index in range(6):
-            assistant.ask(f"message-{index}-" + "x" * (MAX_ASSISTANT_HISTORY_TEXT + 200))
-
-    assert len(assistant._history) == MAX_ASSISTANT_HISTORY_ENTRIES
-    assert all(len(entry["content"]) <= MAX_ASSISTANT_HISTORY_TEXT for entry in assistant._history)
-    assert not any("message-0" in entry["content"] for entry in assistant._history)
-    assert not any("message-1" in entry["content"] for entry in assistant._history)
-
-    rejected = assistant_module._decision_text(
-        RoutingDecision(action="reject", reason="r" * 10_000)
-    )
-    routed = assistant_module._decision_text(
-        RoutingDecision(action="menu", stages=(("/panic " + "x" * 10_000,),))
-    )
-    assert len(rejected) == MAX_ASSISTANT_OPERATION_TEXT
-    assert len(routed) == MAX_ASSISTANT_OPERATION_TEXT
+    assistant = HalcyonAssistant(api_key="private-key-value", client=client)
+    result = assistant.ask("hello", control=MagicMock())
+    assert len(result.text) == 2_000
+    assert "private-key-value" not in result.text
 
 
 def test_assistant_ignores_non_dict_context_provider_result() -> None:
-    payload = {"action": "menu", "stages": [["/panic"]], "reason": "panic"}
-    llm = MagicMock(return_value=json.dumps(payload))
+    client = MagicMock()
+    client.responses.create.return_value = SimpleNamespace(
+        status="completed", output=[], output_text="Ready."
+    )
     assistant = HalcyonAssistant(
         menu_def=load_menu(),
         api_key="sk-test",
-        client=object(),
+        client=client,
         context_provider=lambda: ["PRIVATE_RAW_CONTEXT"],  # type: ignore[arg-type,return-value]
     )
 
-    with patch(_LLM, llm):
-        result = assistant.ask("panic")
-
-    assert "PRIVATE_RAW_CONTEXT" not in llm.call_args.args[0]
-    assert result.decision.commands == ("/panic",)
+    assistant.ask("what is ready?", control=MagicMock())
+    assert "PRIVATE_RAW_CONTEXT" not in str(client.responses.create.call_args.kwargs)

@@ -13,7 +13,7 @@ def test_build_slash_tree_uses_menu_definition_only() -> None:
 
     tree = build_slash_tree(menu_def)
 
-    assert set(tree) == {"synth", "preset", "coach", "panic"}
+    assert set(tree) == {"assistant", "synth", "preset", "coach", "panic"}
     assert set(tree["synth"].children) == {"state", "params", "set", "patch"}
     assert tree["panic"].payload["tool"] == "all_notes_off"
     assert set(tree["coach"].children) == {
@@ -74,6 +74,19 @@ def test_resolve_group_lists_children_without_payload() -> None:
     )
 
 
+def test_coach_practice_flags_are_advertised_by_the_same_leaf_registry() -> None:
+    payloads = dict(iter_slash_leaf_commands(load_menu()))
+
+    for action in ("teach", "replay", "attempt"):
+        command = f"/coach {action}"
+        assert "--practice melody|essentials|full" in payloads[command]["usage"]
+        query = " Saved Song" if action == "teach" else ""
+        resolved = resolve_slash_command(load_menu(), f"{command}{query} --practice melody")
+        assert resolved.status == "leaf"
+        assert resolved.payload == payloads[command]
+        assert resolved.arguments[-2:] == ("--practice", "melody")
+
+
 def test_unknown_command_suggests_from_tree() -> None:
     resolved = resolve_slash_command(load_menu(), "/synt")
 
@@ -114,6 +127,7 @@ def test_leaf_iteration_is_command_listing_source() -> None:
     commands = [command for command, _ in iter_slash_leaf_commands(load_menu())]
 
     assert commands == [
+        "/assistant ask",
         "/synth state",
         "/synth params",
         "/synth set",

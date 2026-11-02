@@ -88,21 +88,21 @@ def test_chat_panel_lists_group_options() -> None:
 
 
 def test_app_slash_input_executes_without_openai() -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
+    calls: list[dict[str, str]] = []
     chat = FakeChatPanel()
     app = SimpleNamespace(menu_def=load_menu(), chat_panel=chat)
 
-    def execute_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
-        calls.append((name, arguments))
-        return {"ok": True}
+    def run_slash(**kwargs: str) -> tuple[int, dict[str, str]]:
+        calls.append(kwargs)
+        return 200, {"run_id": "test", "status": "completed"}
 
-    app._execute_tool_from_worker = execute_tool
+    app.mcp_local_run_slash = run_slash
 
     executed = HalcyonApp._execute_chat_slash_command(app, "/panic")  # type: ignore[arg-type]
 
     assert executed
-    assert calls == [("all_notes_off", {})]
-    assert chat.messages == [("codex", "Ran `/panic`.")]
+    assert calls == [{"command": "/panic", "source": "llm", "local_origin": "chat"}]
+    assert chat.messages == []
 
 
 def test_app_slash_group_lists_children_without_executing() -> None:

@@ -228,7 +228,8 @@ def test_modal_messages_reach_existing_app_handlers_exactly_once(tmp_path: Path)
         assert isinstance(audio, TrackingAudio)
 
         async with app.run_test(size=(180, 55)) as pilot:
-            await pilot.press("comma")
+            app.chat_panel.input.focus()
+            await pilot.press("f2")
             await pilot.pause()
             assert app.screen is app.settings_screen
 
@@ -434,8 +435,14 @@ def test_delete_requires_two_explicit_clicks_and_resets_on_new_typing() -> None:
             delete = app.settings_screen.query_one("#openai-key-delete", Button)
             key_input = app.settings_screen.query_one("#openai-key-input", SecretInput)
 
-            await pilot.click("#openai-key-delete")
-            await pilot.pause()
+            async def click_delete() -> None:
+                async with asyncio.timeout(1):
+                    while delete.has_class("-active"):
+                        await pilot.pause(0.01)
+                assert await pilot.click(delete)
+                await pilot.pause()
+
+            await click_delete()
             assert str(delete.label) == "Confirm delete"
             assert app.delete_messages == []
 
@@ -446,10 +453,10 @@ def test_delete_requires_two_explicit_clicks_and_resets_on_new_typing() -> None:
 
             key_input.value = ""
             await pilot.pause()
-            await pilot.click("#openai-key-delete")
-            await pilot.pause(0.3)
-            await pilot.click("#openai-key-delete")
-            await pilot.pause()
+            await click_delete()
+            assert str(delete.label) == "Confirm delete"
+            assert app.delete_messages == []
+            await click_delete()
 
             assert len(app.delete_messages) == 1
             assert "key" not in repr(vars(app.delete_messages[0])).lower()

@@ -1,5 +1,10 @@
 import pytest
 from concurrent.futures import Future
+from unittest.mock import MagicMock
+
+from halcyon.coach_authoring import LessonService
+from halcyon.coach_models import CoachError, LessonRequest
+from halcyon.coach_store import LessonStore
 
 from halcyon.command_executor import (
     CommandProgress,
@@ -16,6 +21,21 @@ from halcyon.menu import load_menu
 
 class FakeHost:
     pass
+
+
+def test_assistant_is_a_registered_command_with_session_validation():
+    invocation = prepare_slash_command(
+        load_menu(), '/assistant ask "make it darker" --session-id ' + "a" * 32
+    )
+    assert invocation.tool == "ask_assistant"
+    assert invocation.arguments == {"goal": "make it darker", "session_id": "a" * 32}
+    for command in (
+        "/assistant ask",
+        '/assistant ask "goal" --session-id invalid',
+        "/assistant ask " + "x" * 2_001,
+    ):
+        with pytest.raises(CommandExecutionError):
+            prepare_slash_command(load_menu(), command)
 
 
 def test_prepare_slash_command_maps_set_to_tool_arguments() -> None:
@@ -126,7 +146,7 @@ def test_prepare_coach_teach_preserves_query_and_parses_all_options() -> None:
     invocation = prepare_slash_command(
         load_menu(),
         '/coach teach "Aphex Twin Avril 14th" --segment "Main Melody" '
-        "--tempo 75 --difficulty foundation --hand right --loops 3 --author bounded",
+        "--tempo 75 --practice melody --difficulty foundation --hand right --loops 3 --author bounded",
     )
 
     assert invocation.tool == "start_coach_lesson"
@@ -134,6 +154,7 @@ def test_prepare_coach_teach_preserves_query_and_parses_all_options() -> None:
         "query": "Aphex Twin Avril 14th",
         "segment": "Main Melody",
         "tempo_percent": 75,
+        "practice_level": "melody",
         "difficulty": "foundation",
         "hand": "right",
         "loops": 3,
@@ -141,7 +162,7 @@ def test_prepare_coach_teach_preserves_query_and_parses_all_options() -> None:
     }
 
 
-def test_prepare_coach_commands_use_bounded_defaults_and_optional_values() -> None:
+def test_prepare_coach_commands_use_saved_only_defaults_and_optional_values() -> None:
     teach = prepare_slash_command(load_menu(), "/coach teach My Melody")
     replay = prepare_slash_command(load_menu(), "/coach replay")
     attempt = prepare_slash_command(load_menu(), "/coach attempt --count-in 0")
@@ -151,13 +172,24 @@ def test_prepare_coach_commands_use_bounded_defaults_and_optional_values() -> No
         "query": "My Melody",
         "segment": None,
         "tempo_percent": 100,
+        "practice_level": "full",
         "difficulty": None,
         "hand": None,
         "loops": 1,
-        "author": "bounded",
+        "author": "never",
     }
-    assert replay.arguments == {"segment": None, "tempo_percent": None, "loops": None}
-    assert attempt.arguments == {"segment": None, "tempo_percent": None, "count_in": 0}
+    assert replay.arguments == {
+        "segment": None,
+        "tempo_percent": None,
+        "practice_level": None,
+        "loops": None,
+    }
+    assert attempt.arguments == {
+        "segment": None,
+        "tempo_percent": None,
+        "practice_level": None,
+        "count_in": 0,
+    }
     assert feedback.arguments == {"attempt_id": "attempt-7"}
 
 
@@ -168,6 +200,36 @@ def test_prepare_coach_teach_preserves_explicit_cache_only_opt_out() -> None:
     )
 
     assert invocation.arguments["author"] == "never"
+
+
+@pytest.mark.parametrize("action", ("teach tune", "replay", "attempt"))
+@pytest.mark.parametrize("level", ("melody", "essentials", "full"))
+def test_prepare_coach_practice_is_independent_of_tempo(action: str, level: str) -> None:
+    invocation = prepare_slash_command(
+        load_menu(), f"/coach {action} --practice {level} --tempo 25"
+    )
+
+    assert invocation.arguments["practice_level"] == level
+    assert invocation.arguments["tempo_percent"] == 25
+
+
+def test_default_teach_cache_miss_never_calls_authoring_provider(tmp_path) -> None:
+    invocation = prepare_slash_command(
+        load_menu(), '/coach teach "Avril 14" --segment melody --tempo 25'
+    )
+    provider = MagicMock()
+    service = LessonService(store=LessonStore(root=tmp_path), provider=provider)
+    with pytest.raises(CoachError) as caught:
+        service.resolve(
+            LessonRequest(
+                query=invocation.arguments["query"],
+                segment=invocation.arguments["segment"],
+                author=invocation.arguments["author"],
+            )
+        )
+    assert caught.value.code == "SOURCE_REQUIRED"
+    provider.propose.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("attempt_id", ('""', "x" * 129))
@@ -189,6 +251,13 @@ def test_prepare_coach_feedback_rejects_invalid_attempt_id(attempt_id: str) -> N
         ("/coach teach tune --loops 0", "loops"),
         ("/coach teach tune --loops 9", "loops"),
         ("/coach teach tune --difficulty expert", "difficulty"),
+        ("/coach teach tune --practice beginner", "practice"),
+        ("/coach replay --practice unknown", "practice"),
+        ("/coach attempt --practice easy", "practice"),
+        ("/coach teach tune --practice melody --practice full", "practice"),
+        ("/coach replay --practice melody --practice full", "practice"),
+        ("/coach attempt --practice melody --practice full", "practice"),
+        ("/coach attempt --practice", "practice"),
         ("/coach teach tune --hand middle", "hand"),
         ("/coach teach tune --author always", "author"),
         ("/coach attempt --count-in 9", "count-in"),

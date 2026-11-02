@@ -30,6 +30,7 @@ class ToolHost(Protocol):
         query: str,
         segment: str | None,
         tempo_percent: int,
+        practice_level: str,
         difficulty: str | None,
         hand: str | None,
         loops: int,
@@ -41,6 +42,7 @@ class ToolHost(Protocol):
         *,
         segment: str | None,
         tempo_percent: int | None,
+        practice_level: str | None,
         loops: int | None,
     ) -> Any: ...
 
@@ -49,6 +51,7 @@ class ToolHost(Protocol):
         *,
         segment: str | None,
         tempo_percent: int | None,
+        practice_level: str | None,
         count_in: int | None,
     ) -> Any: ...
 
@@ -141,6 +144,11 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "query": {"type": "string", "minLength": 1, "maxLength": 160},
                     "segment": {"type": ["string", "null"], "maxLength": 80},
                     "tempo_percent": {"type": "integer", "minimum": 25, "maximum": 200},
+                    "practice_level": {
+                        "type": "string",
+                        "enum": ["melody", "essentials", "full"],
+                        "default": "full",
+                    },
                     "difficulty": {
                         "type": ["string", "null"],
                         "enum": ["foundation", "standard", "challenge", None],
@@ -163,6 +171,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "additionalProperties": False,
                 "properties": {
                     "segment": {"type": ["string", "null"], "maxLength": 80},
+                    "practice_level": {
+                        "type": ["string", "null"],
+                        "enum": ["melody", "essentials", "full", None],
+                    },
                     "tempo_percent": {
                         "type": ["integer", "null"],
                         "minimum": 25,
@@ -187,6 +199,10 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "additionalProperties": False,
                 "properties": {
                     "segment": {"type": ["string", "null"], "maxLength": 80},
+                    "practice_level": {
+                        "type": ["string", "null"],
+                        "enum": ["melody", "essentials", "full", None],
+                    },
                     "tempo_percent": {
                         "type": ["integer", "null"],
                         "minimum": 25,
@@ -292,6 +308,7 @@ def execute_tool(host: ToolHost, name: str, arguments: dict[str, Any] | None = N
                     "query",
                     "segment",
                     "tempo_percent",
+                    "practice_level",
                     "difficulty",
                     "hand",
                     "loops",
@@ -302,6 +319,11 @@ def execute_tool(host: ToolHost, name: str, arguments: dict[str, Any] | None = N
                 query=_bounded_string(arguments, "query", 160),
                 segment=_optional_bounded_string(arguments, "segment", 80),
                 tempo_percent=_bounded_int(arguments, "tempo_percent", 25, 200),
+                practice_level=_required_enum(
+                    {"practice_level": "full", **arguments},
+                    "practice_level",
+                    {"melody", "essentials", "full"},
+                ),
                 difficulty=_optional_enum(
                     arguments,
                     "difficulty",
@@ -312,17 +334,27 @@ def execute_tool(host: ToolHost, name: str, arguments: dict[str, Any] | None = N
                 author=_required_enum(arguments, "author", {"never", "bounded"}),
             )
         if name == "replay_coach_lesson":
-            _require_allowed_arguments(arguments, {"segment", "tempo_percent", "loops"})
+            _require_allowed_arguments(
+                arguments, {"segment", "tempo_percent", "practice_level", "loops"}
+            )
             return host.coach_tool_replay_lesson(
                 segment=_optional_bounded_string(arguments, "segment", 80),
                 tempo_percent=_optional_bounded_int(arguments, "tempo_percent", 25, 200),
+                practice_level=_optional_enum(
+                    arguments, "practice_level", {"melody", "essentials", "full"}
+                ),
                 loops=_optional_bounded_int(arguments, "loops", 1, 8),
             )
         if name == "start_coach_attempt":
-            _require_allowed_arguments(arguments, {"segment", "tempo_percent", "count_in"})
+            _require_allowed_arguments(
+                arguments, {"segment", "tempo_percent", "practice_level", "count_in"}
+            )
             return host.coach_tool_start_attempt(
                 segment=_optional_bounded_string(arguments, "segment", 80),
                 tempo_percent=_optional_bounded_int(arguments, "tempo_percent", 25, 200),
+                practice_level=_optional_enum(
+                    arguments, "practice_level", {"melody", "essentials", "full"}
+                ),
                 count_in=_optional_bounded_int(arguments, "count_in", 0, 8),
             )
         if name == "get_coach_feedback":

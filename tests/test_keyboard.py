@@ -1,18 +1,24 @@
 from halcyon.keyboard import (
     BLACK_HALCYON_STYLE,
     BLACK_TARGET_STYLE,
+    BOTH_MARKER_STYLE,
     COMBINED_STATE_STYLE,
-    HALCYON_MARKER_STYLE,
     HUMAN_MARKER_STYLE,
     KEYBOARD_HEIGHT,
     MIDI_END_NOTE,
     MIDI_KEY_COUNT,
     MIDI_START_NOTE,
+    NATURAL_HALCYON_MARKER_STYLE,
+    NATURAL_TARGET_MARKER_STYLE,
     LPK25_KEY_COUNT,
     LPK25_START_NOTE,
+    SHARP_HALCYON_MARKER_STYLE,
+    SHARP_TARGET_MARKER_STYLE,
     VISIBLE_KEYBOARD_WIDTH,
     VISIBLE_WHITE_KEY_COUNT,
+    WHITE_HALCYON_STYLE,
     WHITE_KEY_WIDTH,
+    WHITE_TARGET_STYLE,
     key_bounds,
     key_left,
     key_markers,
@@ -142,37 +148,63 @@ def test_sticky_scroll_can_reach_top_midi_note() -> None:
     assert target <= keyboard_width() - VISIBLE_KEYBOARD_WIDTH
 
 
-def test_target_key_style_is_distinct() -> None:
-    target_style = key_style(61, set(), {61})
+def test_target_key_styles_follow_pitch_class_palette() -> None:
+    natural_style = key_style(60, set(), {60})
+    sharp_style = key_style(61, set(), {61})
 
-    assert target_style == BLACK_TARGET_STYLE
+    assert natural_style == WHITE_TARGET_STYLE
+    assert "#ab9df2" in natural_style
+    assert sharp_style == BLACK_TARGET_STYLE
+    assert "#78dce8" in sharp_style
 
 
-def test_human_halcyon_and_both_key_states_are_distinct() -> None:
+def test_human_halcyon_and_both_key_states_preserve_ownership_palette() -> None:
     human_style = key_style(61, {61})
-    halcyon_style = key_style(61, set(), halcyon_notes={61})
+    natural_halcyon_style = key_style(60, set(), halcyon_notes={60})
+    sharp_halcyon_style = key_style(61, set(), halcyon_notes={61})
     both_style = key_style(61, {61}, halcyon_notes={61})
 
-    assert human_style != halcyon_style
-    assert halcyon_style == BLACK_HALCYON_STYLE
+    assert "#ff9f43" in human_style
+    assert natural_halcyon_style == WHITE_HALCYON_STYLE
+    assert "#ab9df2" in natural_halcyon_style
+    assert sharp_halcyon_style == BLACK_HALCYON_STYLE
+    assert "#78dce8" in sharp_halcyon_style
     assert both_style == COMBINED_STATE_STYLE
+    assert "#ffd866" in both_style
 
 
-def test_key_markers_preserve_both_sources_and_independent_target() -> None:
-    markers = key_markers(60, {60}, {60}, {60})
+def test_key_markers_follow_pitch_class_and_preserve_ownership_overrides() -> None:
+    natural_markers = key_markers(60, set(), {60}, {60})
+    sharp_markers = key_markers(61, set(), {61}, {61})
+    shared_markers = key_markers(60, {60}, {60}, {60})
 
-    assert [marker for marker, _style in markers] == ["●◆", "○"]
+    assert natural_markers == (
+        ("◆", NATURAL_HALCYON_MARKER_STYLE),
+        ("○", NATURAL_TARGET_MARKER_STYLE),
+    )
+    assert sharp_markers == (
+        ("◆", SHARP_HALCYON_MARKER_STYLE),
+        ("○", SHARP_TARGET_MARKER_STYLE),
+    )
+    assert shared_markers == (
+        ("●◆", BOTH_MARKER_STYLE),
+        ("○", NATURAL_TARGET_MARKER_STYLE),
+    )
 
 
-def test_keyboard_renders_accessible_legend_and_source_markers() -> None:
-    rendered = keyboard_text({60}, {60}, halcyon_notes={60, 61})
+def test_keyboard_renders_source_markers_without_embedded_legend_words() -> None:
+    rendered = keyboard_text({60, 62}, {60}, halcyon_notes={60, 61})
     compact_rows = rendered.plain.splitlines()[:7]
 
-    assert "● YOU   ◆ HALCYON   ●◆ BOTH   ○ NEXT" in rendered.plain
+    assert all(
+        word not in rendered.plain
+        for word in ("YOU", "HALCYON", "BOTH", "NEXT", "NATURAL", "SHARP")
+    )
     assert "●◆" in rendered.plain
     assert "○" in rendered.plain
     assert any("●◆" in row for row in compact_rows[1:])
     assert any("○" in row for row in compact_rows[1:])
     styles = {str(span.style) for span in rendered.spans}
     assert HUMAN_MARKER_STYLE in styles
-    assert HALCYON_MARKER_STYLE in styles
+    assert SHARP_HALCYON_MARKER_STYLE in styles
+    assert NATURAL_TARGET_MARKER_STYLE in styles

@@ -2,6 +2,7 @@ import pytest
 
 from halcyon.app import HalcyonApp
 from halcyon.coach_models import CoachError
+from halcyon.command_executor import prepare_slash_command
 from halcyon.menu import load_menu
 from halcyon.mcp_tools import ToolExecutionError, execute_tool, tool_definitions
 from halcyon.slash_commands import iter_slash_leaf_commands
@@ -106,6 +107,18 @@ def test_internal_coach_tool_definitions_match_the_six_menu_leaves() -> None:
     )
 
 
+def test_internal_coach_practice_schemas_match_registered_option_values() -> None:
+    schemas = {tool["name"]: tool["inputSchema"] for tool in tool_definitions()}
+    teach = schemas["start_coach_lesson"]["properties"]["practice_level"]
+
+    assert teach == {"type": "string", "enum": ["melody", "essentials", "full"], "default": "full"}
+    for tool in ("replay_coach_lesson", "start_coach_attempt"):
+        assert schemas[tool]["properties"]["practice_level"] == {
+            "type": ["string", "null"],
+            "enum": ["melody", "essentials", "full", None],
+        }
+
+
 def test_execute_tool_validates_and_dispatches() -> None:
     host = FakeHost()
 
@@ -154,6 +167,7 @@ def test_execute_tool_dispatches_validated_coach_teach_only_as_internal_leaf() -
                 "query": "Aphex Twin Avril 14th",
                 "segment": "main melody",
                 "tempo_percent": 75,
+                "practice_level": "full",
                 "difficulty": "foundation",
                 "hand": "right",
                 "loops": 2,
@@ -161,6 +175,48 @@ def test_execute_tool_dispatches_validated_coach_teach_only_as_internal_leaf() -
             },
         )
     ]
+
+
+@pytest.mark.parametrize("action", ("teach Saved Song", "replay", "attempt"))
+@pytest.mark.parametrize("level", ("melody", "essentials", "full"))
+def test_registered_practice_commands_pass_through_internal_leaf_once(action, level) -> None:
+    host = FakeHost()
+    invocation = prepare_slash_command(
+        load_menu(), f"/coach {action} --practice {level} --tempo 25"
+    )
+
+    result = execute_tool(host, invocation.tool, invocation.arguments)
+
+    assert result["ok"] is True
+    assert len(host.calls) == 1
+    assert host.calls[0][1]["practice_level"] == level
+    assert host.calls[0][1]["tempo_percent"] == 25
+
+
+@pytest.mark.parametrize("tool", ("replay_coach_lesson", "start_coach_attempt"))
+def test_internal_replay_attempt_omission_preserves_active_practice_level(tool) -> None:
+    host = FakeHost()
+
+    execute_tool(host, tool, {})
+
+    assert len(host.calls) == 1
+    assert host.calls[0][1]["practice_level"] is None
+
+
+@pytest.mark.parametrize("level", ("beginner", False, 1, ""))
+@pytest.mark.parametrize(
+    "tool", ("start_coach_lesson", "replay_coach_lesson", "start_coach_attempt")
+)
+def test_internal_practice_enum_is_revalidated_before_host_call(tool, level) -> None:
+    host = FakeHost()
+    arguments = {"practice_level": level}
+    if tool == "start_coach_lesson":
+        arguments.update(query="Saved Song", tempo_percent=100, loops=1, author="never")
+
+    with pytest.raises(ToolExecutionError, match="practice_level"):
+        execute_tool(host, tool, arguments)
+
+    assert host.calls == []
 
 
 @pytest.mark.parametrize(

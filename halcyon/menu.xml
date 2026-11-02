@@ -1,4 +1,16 @@
 <menu>
+    <option name="Assistant" shortcut="assistant" description="Talk to Halcyon's app-owned assistant">
+        <suboption
+            name="Ask"
+            shortcut="ask"
+            tool="ask_assistant"
+            usage="/assistant ask &quot;GOAL&quot; [--session-id ID]"
+            description="Discuss music or delegate a goal to the assistant; retain the returned session_id for follow-ups"
+            mcp_concurrency_group="assistant"
+            mcp_parallel_ok="false"
+            mcp_poll_after_s="1"
+        />
+    </option>
     <option name="Synth" shortcut="synth" description="Inspect and adjust the current synth patch">
         <suboption
             name="State"
@@ -56,8 +68,8 @@
             name="Teach"
             shortcut="teach"
             tool="start_coach_lesson"
-            usage="/coach teach QUERY [--segment LABEL --tempo 25..200 --difficulty foundation|standard|challenge --hand left|right|both --loops 1..8 --author never|bounded]"
-            description="Reuse a saved lesson or author one local bounded approximation for a named segment, then demonstrate, capture, and score it; --author never is cache-only"
+            usage="/coach teach QUERY [--segment LABEL --tempo 25..200 --practice melody|essentials|full --difficulty foundation|standard|challenge --hand left|right|both --loops 1..8 --author never|bounded]"
+            description="Demonstrate saved MIDI; --practice selects a supported note layer (default full), independently of tempo and declared difficulty. Omitted notes are optional ghosts. Saved-only unless explicit --author bounded generation is requested"
             mcp_concurrency_group="coach_session"
             mcp_poll_after_s="1"
         />
@@ -65,8 +77,8 @@
             name="Replay"
             shortcut="replay"
             tool="replay_coach_lesson"
-            usage="/coach replay [--segment LABEL --tempo 25..200 --loops 1..8]"
-            description="Replay the active saved lesson without authoring or overwriting it"
+            usage="/coach replay [--segment LABEL --tempo 25..200 --practice melody|essentials|full --loops 1..8]"
+            description="Replay the active saved lesson without overwriting it; omitted --practice retains the current note layer"
             mcp_concurrency_group="coach_session"
             mcp_poll_after_s="1"
         />
@@ -74,8 +86,8 @@
             name="Attempt"
             shortcut="attempt"
             tool="start_coach_attempt"
-            usage="/coach attempt [--segment LABEL --tempo 25..200 --count-in 0..8]"
-            description="Capture and score a fresh human-only attempt against the active lesson"
+            usage="/coach attempt [--segment LABEL --tempo 25..200 --practice melody|essentials|full --count-in 0..8]"
+            description="Score a fresh human-only attempt; omitted --practice retains the current note layer. Ghost notes are optional and unscored"
             mcp_concurrency_group="coach_session"
             mcp_poll_after_s="1"
         />
@@ -86,6 +98,8 @@
             usage="/coach feedback [attempt_id]"
             description="End an active capture early or retrieve one bounded deterministic report"
             mcp_concurrency_group="coach_session"
+            mcp_single_flight="false"
+            mcp_parallel_ok="true"
             mcp_poll_after_s="1"
         />
         <suboption

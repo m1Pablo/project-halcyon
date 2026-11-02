@@ -7,6 +7,7 @@ import pytest
 
 import halcyon.coach_scoring as scoring_module
 from halcyon.coach_models import LatencyProfile, LessonTimeline, ResolvedLessonEvent
+from halcyon.coach_practice import PracticeLevel
 from halcyon.coach_scoring import (
     DEFAULT_SCORE_CONFIG,
     CoachingReport,
@@ -180,6 +181,104 @@ def _request(
         latency_profile=profile,
         truncated=truncated,
     )
+
+
+def _practice_timeline(
+    notes: tuple[tuple[int, int, int], ...], required: frozenset[int]
+) -> LessonTimeline:
+    timeline = _timeline(notes)
+    return replace(
+        timeline,
+        practice_level=PracticeLevel.MELODY,
+        events=tuple(
+            replace(event, required=int(event.lesson_event_id.split("-")[2]) in required)
+            for event in timeline.events
+        ),
+    )
+
+
+def test_required_only_and_voluntary_ghosts_have_identical_perfect_scores() -> None:
+    required = ((60, 0, 200_000), (62, 500_000, 200_000), (64, 1_000_000, 200_000))
+    ghosts = ((67, 0, 200_000), (69, 500_000, 200_000), (71, 1_000_000, 200_000))
+    timeline = _practice_timeline(required + ghosts, frozenset({0, 1, 2}))
+    source_events = timeline.events
+    alone = score_attempt(_request(timeline, _observed_notes(required)))
+    expanded = score_attempt(_request(timeline, _observed_notes(required + ghosts)))
+
+    assert alone.metrics.overall_score_percent == expanded.metrics.overall_score_percent == 100
+    assert alone.metrics.expected_note_count == expanded.metrics.expected_note_count == 3
+    assert alone.metrics.matched_note_count == expanded.metrics.matched_note_count == 3
+    assert alone.metrics.extra_count == expanded.metrics.extra_count == 0
+    assert alone.metrics.missed_count == expanded.metrics.missed_count == 0
+    assert alone.issues == expanded.issues == ()
+    assert alone.practice_level == expanded.practice_level == "melody"
+    assert alone.ghost_note_count == expanded.ghost_note_count == 3
+    assert expanded.to_public_dict()["lesson"]["practice_level"] == "melody"
+    assert expanded.to_public_dict()["lesson"]["ghost_note_count"] == 3
+    assert timeline.events == source_events
+
+
+def test_ghost_only_chord_misses_required_note_without_optional_penalty() -> None:
+    timeline = _practice_timeline(((60, 0, 200_000), (64, 0, 200_000)), frozenset({0}))
+    report = score_attempt(_request(timeline, _observed_notes(((64, 0, 200_000),))))
+
+    assert report.metrics.expected_note_count == 1
+    assert report.metrics.matched_note_count == 0
+    assert report.metrics.missed_count == 1
+    assert report.metrics.wrong_pitch_count == report.metrics.extra_count == 0
+    assert all(issue.expected_note != 64 for issue in report.issues)
+
+
+@pytest.mark.parametrize("required_index", [0, 1])
+@pytest.mark.parametrize("separation_us", [0, 20_000, 80_000])
+def test_same_pitch_ghost_cannot_steal_required_match(
+    required_index: int, separation_us: int
+) -> None:
+    notes = ((60, 0, 100_000), (60, separation_us, 100_000))
+    timeline = _practice_timeline(notes, frozenset({required_index}))
+    report = score_attempt(_request(timeline, _observed_notes((notes[required_index],))))
+
+    assert report.metrics.overall_score_percent == 100
+    assert report.metrics.matched_note_count == report.metrics.expected_note_count == 1
+    assert report.metrics.missed_count == report.metrics.extra_count == 0
+    assert report.metrics.wrong_pitch_count == 0
+
+
+def test_unrelated_pitch_and_late_ghost_still_count_as_extras() -> None:
+    timeline = _practice_timeline(((60, 0, 200_000), (64, 0, 200_000)), frozenset({0}))
+    played = ((60, 0, 200_000), (65, 0, 200_000), (64, 500_000, 200_000))
+    report = score_attempt(_request(timeline, _observed_notes(played)))
+
+    assert report.metrics.matched_note_count == 1
+    assert report.metrics.extra_count == 2
+    assert report.metrics.overall_score_percent < 100
+
+
+def test_wrong_required_pitch_is_not_excused_by_a_matching_ghost() -> None:
+    timeline = _practice_timeline(((60, 0, 200_000), (64, 0, 200_000)), frozenset({0}))
+    played = ((61, 0, 200_000), (64, 0, 200_000))
+    report = score_attempt(_request(timeline, _observed_notes(played)))
+
+    assert report.metrics.wrong_pitch_count == 1
+    assert report.metrics.extra_count == 0
+    assert report.metrics.overall_score_percent < 100
+
+
+def test_ghosts_do_not_establish_latency_or_duration_penalties() -> None:
+    required = ((60, 0, 200_000),)
+    ghosts = ((64, 500_000, 200_000), (65, 1_000_000, 200_000), (67, 1_500_000, 200_000))
+    timeline = _practice_timeline(required + ghosts, frozenset({0}))
+    observed = _observed_notes(
+        required
+        + tuple((note, onset + 30_000, duration + 500_000) for note, onset, duration in ghosts)
+    )
+    report = score_attempt(_request(timeline, observed))
+
+    assert report.latency.source == "default"
+    assert report.latency.offset_us == 0
+    assert report.metrics.overall_score_percent == 100
+    assert report.metrics.held_duration_mean_deviation_ms == 0
+    assert report.issues == ()
 
 
 @pytest.fixture

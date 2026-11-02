@@ -35,6 +35,7 @@ from halcyon.coach_models import (
     normalize_lesson_alias,
     resolve_timeline,
 )
+from halcyon.coach_practice import PracticeLevel
 
 _PROPOSAL_KEYS = frozenset(
     {
@@ -388,10 +389,18 @@ class LessonService:
                 "No saved lesson matches this cache-only request.",
                 field="author",
                 resolution=(
-                    "Retry without --author never and name the part to learn, for example: "
-                    '/coach teach "work title" --segment "main melody".'
+                    "Check the saved lesson library for the correct query and segment. "
+                    "To deliberately generate an approximation instead, use "
+                    '/coach teach "work title" --segment "main melody" --author bounded.'
                 ),
                 retryable=True,
+            )
+        if request.practice_level is not PracticeLevel.FULL:
+            raise CoachError(
+                "PRACTICE_UNAVAILABLE",
+                "A new generated source has no reviewed reduced practice arrangement.",
+                field="practice",
+                resolution="Use a supported saved source or retry generation with --practice full.",
             )
         if request.segment is None:
             raise CoachError(
@@ -400,7 +409,7 @@ class LessonService:
                 field="segment",
                 resolution=(
                     'Name the segment, for example: /coach teach "work title" '
-                    '--segment "main melody".'
+                    '--segment "main melody" --author bounded.'
                 ),
                 retryable=True,
             )

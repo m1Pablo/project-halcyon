@@ -251,6 +251,19 @@ def execute_slash_command_outcome(
 
 def _tool_arguments(tool: str, resolved: SlashResolved) -> dict[str, Any]:
     args = resolved.arguments
+    if tool == "ask_assistant":
+        positionals, options = _parse_coach_options(
+            resolved, allowed={"session-id"}, allow_positionals=True
+        )
+        goal = " ".join(positionals).strip()
+        if not goal or len(goal) > 2_000:
+            raise CommandExecutionError("Assistant goal must contain 1 through 2000 characters.")
+        session_id = options.get("session-id")
+        if session_id is not None and not re.fullmatch(r"[0-9a-f]{32}", session_id):
+            raise CommandExecutionError(
+                "session-id must be a returned assistant session identifier."
+            )
+        return {"goal": goal, "session_id": session_id}
     if tool in {"get_synth_state", "list_synth_params", "all_notes_off"}:
         _require_arg_count(resolved.leaf_command, args, 0)
         return {}
@@ -297,6 +310,7 @@ def _tool_arguments(tool: str, resolved: SlashResolved) -> dict[str, Any]:
 
 
 _COACH_ENUMS: dict[str, frozenset[str]] = {
+    "practice": frozenset({"melody", "essentials", "full"}),
     "difficulty": frozenset({"foundation", "standard", "challenge"}),
     "hand": frozenset({"left", "right", "both"}),
     "author": frozenset({"never", "bounded"}),
@@ -307,7 +321,7 @@ _INTEGER_RE = re.compile(r"^[0-9]+$")
 def _coach_teach_arguments(resolved: SlashResolved) -> dict[str, Any]:
     positionals, options = _parse_coach_options(
         resolved,
-        allowed={"segment", "tempo", "difficulty", "hand", "loops", "author"},
+        allowed={"segment", "tempo", "practice", "difficulty", "hand", "loops", "author"},
         allow_positionals=True,
     )
     query = " ".join(positionals).strip()
@@ -319,17 +333,18 @@ def _coach_teach_arguments(resolved: SlashResolved) -> dict[str, Any]:
         "query": query,
         "segment": _bounded_option(options, "segment", 80),
         "tempo_percent": _integer_option(options, "tempo", 25, 200, default=100),
+        "practice_level": _enum_option(options, "practice", default="full"),
         "difficulty": _enum_option(options, "difficulty"),
         "hand": _enum_option(options, "hand"),
         "loops": _integer_option(options, "loops", 1, 8, default=1),
-        "author": _enum_option(options, "author", default="bounded"),
+        "author": _enum_option(options, "author", default="never"),
     }
 
 
 def _coach_replay_arguments(resolved: SlashResolved) -> dict[str, Any]:
     positionals, options = _parse_coach_options(
         resolved,
-        allowed={"segment", "tempo", "loops"},
+        allowed={"segment", "tempo", "practice", "loops"},
         allow_positionals=False,
     )
     if positionals:
@@ -337,6 +352,7 @@ def _coach_replay_arguments(resolved: SlashResolved) -> dict[str, Any]:
     return {
         "segment": _bounded_option(options, "segment", 80),
         "tempo_percent": _integer_option(options, "tempo", 25, 200),
+        "practice_level": _enum_option(options, "practice"),
         "loops": _integer_option(options, "loops", 1, 8),
     }
 
@@ -344,7 +360,7 @@ def _coach_replay_arguments(resolved: SlashResolved) -> dict[str, Any]:
 def _coach_attempt_arguments(resolved: SlashResolved) -> dict[str, Any]:
     positionals, options = _parse_coach_options(
         resolved,
-        allowed={"segment", "tempo", "count-in"},
+        allowed={"segment", "tempo", "practice", "count-in"},
         allow_positionals=False,
     )
     if positionals:
@@ -352,6 +368,7 @@ def _coach_attempt_arguments(resolved: SlashResolved) -> dict[str, Any]:
     return {
         "segment": _bounded_option(options, "segment", 80),
         "tempo_percent": _integer_option(options, "tempo", 25, 200),
+        "practice_level": _enum_option(options, "practice"),
         "count_in": _integer_option(options, "count-in", 0, 8),
     }
 

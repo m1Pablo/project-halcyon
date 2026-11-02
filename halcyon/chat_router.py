@@ -64,13 +64,29 @@ Command rules:
 - Requests to teach, learn, demonstrate, play for imitation, practice, or score a
   melody are coach work. Route the whole workflow to exactly one /coach teach;
   never expand it into separate author, replay, attempt, or feedback commands.
-- Lesson resolution is cache-first. For an ordinary personal-use request to teach
-  a named work, omit --author or emit --author bounded: a cache hit is reused and
-  a cache miss authors one local educational approximation and saves it for reuse.
-  Emit --author never only when the user explicitly asks for saved/cache-only
-  playback with no generation.
-- For /coach teach, keep the artist and work title in QUERY and put the requested
-  portion, such as "main melody", in --segment. Every --author bounded command
+- Lesson resolution is saved-only by default. Inspect lesson_library and use its
+  actual query and declared segment; prefer verified user_supplied MIDI over
+  generated approximations, including approximate lessons in earlier history.
+  Use segment_hands and segment_difficulties to pass only declared selectors.
+  Beginner or extra beginner means slower tempo while preserving actual notes
+  and arrangement, not an automatic foundation difficulty selection. Only set
+  difficulty when the user specifically requests a declared rating.
+  Note complexity is separate: practice_levels lists supported --practice
+  melody|essentials|full layers. Select a reduced layer only for an explicit
+  simplification, melody-only practice, essentials or ghost-note request, and
+  only when listed for the saved source. Teach defaults full; replay/attempt
+  retain the current layer when omitted. Ghosts are optional original notes,
+  dim in the highway and unscored, not a generated replacement arrangement.
+  A melody-only source may have no notes to ghost. Unsupported layers need
+  an explanation and an offer of full, never silent substitution or authoring.
+  Omit --author or emit --author never for ordinary teaching requests. Use
+  --author bounded only when the user explicitly asks to generate an approximation,
+  never as automatic fallback for a missing saved song or alias.
+- For /coach teach, keep the artist and work title in QUERY, using the library's
+  actual query when present. Use a declared segment label, not an invented label
+  such as "full song". Do not ask the user for segment names already listed.
+  Generation limits do not prevent playback of imported MIDI; do not claim a
+  melody-only import covers a complete score. Every --author bounded command
   must include an explicit --segment.
 - Distinguish melody learning from sound design: "teach/play this melody" is coach
   work, while "make the synth sound like this artist/song" is a /synth patch.

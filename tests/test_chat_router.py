@@ -185,10 +185,10 @@ def test_router_maps_melody_learning_to_one_umbrella_coach_teach() -> None:
         "stages": [
             [
                 '/coach teach "Aphex Twin Avril 14th" --segment "main melody" '
-                "--tempo 70 --loops 2 --author bounded"
+                "--tempo 70 --loops 2 --author never"
             ]
         ],
-        "reason": "reuse or create one local lesson",
+        "reason": "use the saved imported lesson",
     }
     llm = _llm_returning(payload)
 
@@ -199,19 +199,51 @@ def test_router_maps_melody_learning_to_one_umbrella_coach_teach() -> None:
         )
 
     prompt = llm.call_args.args[0]
-    assert "Lesson resolution is cache-first" in prompt
-    assert "omit --author or emit --author bounded" in prompt
-    assert "--author never only when the user explicitly asks for saved/cache-only" in prompt
+    assert "Lesson resolution is saved-only by default" in prompt
+    assert "Omit --author or emit --author never" in prompt
+    assert "only when the user explicitly asks to generate an approximation" in prompt
     assert "keep the artist and work title in QUERY" in prompt
     assert "Every --author bounded command" in prompt
+    assert "Beginner or extra beginner means slower tempo" in prompt
+    assert "not an automatic foundation difficulty selection" in prompt
+    assert "Note complexity is separate" in prompt
+    assert "only when listed for the saved source" in prompt
+    assert "Ghosts are optional original notes" in prompt
     assert decision.action == "menu"
     assert decision.commands == (
         '/coach teach "Aphex Twin Avril 14th" --segment "main melody" '
-        "--tempo 70 --loops 2 --author bounded",
+        "--tempo 70 --loops 2 --author never",
     )
 
 
-def test_router_allows_ordinary_personal_use_cache_miss_authoring() -> None:
+def test_router_preserves_explicit_supported_practice_layer_and_slow_tempo() -> None:
+    command = (
+        '/coach teach "Satie" --segment "complete piece" '
+        "--practice essentials --tempo 25 --author never"
+    )
+    llm = _llm_returning({"action": "menu", "stages": [[command]], "reason": "saved note layer"})
+
+    with patch(_LLM, llm):
+        decision = run_chat_routing(
+            "Simplify Satie to the essentials and show optional ghosts, extra slow",
+            api_key="sk-test",
+            app_context={
+                "lesson_library": [
+                    {
+                        "query": "Satie",
+                        "segments": ["complete piece"],
+                        "practice_levels": ["melody", "essentials", "full"],
+                    }
+                ]
+            },
+        )
+
+    assert decision.action == "menu"
+    assert decision.commands == (command,)
+    assert '"practice_levels":["melody","essentials","full"]' in llm.call_args.args[0]
+
+
+def test_router_allows_explicit_approximation_authoring() -> None:
     payload = {
         "action": "menu",
         "stages": [
@@ -225,7 +257,7 @@ def test_router_allows_ordinary_personal_use_cache_miss_authoring() -> None:
 
     with patch(_LLM, _llm_returning(payload)):
         decision = run_chat_routing(
-            "Help me learn Aphex Twin's Avril 14th main melody",
+            "Generate a local approximation of Aphex Twin's Avril 14th main melody",
             api_key="sk-test",
         )
 

@@ -18,6 +18,8 @@ def _fake_halcyon_app() -> HalcyonApp:
     app.menu_def = load_menu()
     app._run_tracker = RunTracker()
     app.calls = []
+    # This fixture exercises command authority, not mounted console presentation.
+    app._remember_console_run = lambda *_args: None
 
     def execute_tool(name: str, arguments: dict[str, object]) -> dict[str, object]:
         app.calls.append((name, arguments))
@@ -41,6 +43,19 @@ def test_app_mcp_run_slash_dispatches_through_command_executor() -> None:
     assert payload["run_id"]
     assert payload["do_not_rerun"] is False
     assert app.calls == [("set_synth_param", {"param": "tone", "value": 0.7})]
+
+
+def test_ended_assistant_cannot_dispatch_a_queued_mutation():
+    app = _fake_halcyon_app()
+    app._closing = False
+    parent, _ = app._run_tracker.create_run(command="/assistant ask", source="llm")
+    app._run_tracker.mark_timeout(parent)
+    code, result = app.mcp_local_run_slash(
+        command="/synth set tone 0.7", source="llm", parent_run_id=parent
+    )
+    assert code == 409
+    assert "ended" in result["error"]
+    assert app.calls == []
 
 
 def test_app_mcp_run_slash_deduplicates_active_single_flight_group() -> None:
@@ -135,6 +150,49 @@ def _http_json(
             return response.status, json.loads(response.read().decode("utf-8"))
     except error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "path, payload",
+    [
+        ("/ask", {"goal": ""}),
+        ("/ask", {"goal": "g" * 2_001}),
+        ("/ask", {"goal": "help", "session_id": None}),
+        ("/ask", {"goal": "help", "source": []}),
+        ("/ask", {"goal": "help", "max_wait_s": True}),
+        ("/wait_for_run", {"run_id": RUN_ID, "cursor": -1}),
+        ("/wait_for_run", {"run_id": RUN_ID, "cursor": True}),
+        ("/wait_for_run", {"run_id": RUN_ID, "max_wait_s": 11}),
+        ("/wait_for_run", {"run_id": "../private"}),
+    ],
+)
+def test_assistant_http_arguments_fail_closed(path, payload):
+    fake_app = FakeServerApp()
+    server = LocalControlServer(fake_app, preferred_port=0)
+    server.start()
+    try:
+        code, result = _http_json(server.api_url, "POST", path, payload)
+        assert code == 400
+        assert result["error"]["code"] == "INVALID_ARGUMENTS"
+        assert not fake_app.runs
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    "headers", [{"Host": "attacker.example"}, {"Origin": "https://attacker.example"}]
+)
+def test_foreign_hosts_and_origins_cannot_reach_local_control(headers):
+    fake_app = FakeServerApp()
+    server = LocalControlServer(fake_app, preferred_port=0)
+    server.start()
+    try:
+        req = request.Request(server.api_url + "/state", headers=headers)
+        with pytest.raises(error.HTTPError) as caught:
+            request.urlopen(req, timeout=2)
+        assert caught.value.code == 403
+    finally:
+        server.stop()
 
 
 def _http_raw(

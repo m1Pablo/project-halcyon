@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import heapq
 import threading
 import time
@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 import halcyon.coach_engine as engine_module
+import halcyon.coach_practice as practice_module
 from halcyon.coach_authoring import AuthoringControl
 from halcyon.coach_engine import CoachEngine, CoachPhase
 from halcyon.coach_models import (
@@ -27,6 +28,7 @@ from halcyon.coach_models import (
     create_lesson_revision,
     resolve_timeline,
 )
+from halcyon.coach_practice import PracticeLevel
 from halcyon.event_bus import HalcyonMidiAdapter, MidiEventAdapter, MidiEventBus, ReceiptPoll
 from halcyon.midi import MidiOrigin
 
@@ -379,21 +381,193 @@ def _teach(runtime: Runtime, *, loops: int = 1):
     return pending
 
 
-def test_teach_exact_playback_uses_one_anchor_bus_only_and_scores_human_capture(
+def _practice_lesson(monkeypatch, *, trailing_ghosts: bool = False):
+    base = _lesson()
+    notes = (60, 61, 64)
+    events = tuple(replace(base.events[0], event_id="", note=note) for note in notes) + tuple(
+        replace(base.events[1], event_id="", note=note, delta_tick=480 if index == 0 else 0)
+        for index, note in enumerate(notes)
+    )
+    if trailing_ghosts:
+        events = (
+            events[0],
+            replace(events[3], absolute_tick=240, delta_tick=240),
+            replace(events[1], absolute_tick=240),
+            replace(events[2], absolute_tick=240),
+            replace(events[4], delta_tick=240),
+            events[5],
+        )
+    lesson = create_lesson_revision(
+        lesson_id="practice-chord",
+        created_at=base.created_at,
+        aliases=base.aliases,
+        title=base.title,
+        composer=base.composer,
+        difficulty=base.difficulty,
+        hand=base.hand,
+        ppq=base.ppq,
+        tempo_map=base.tempo_map,
+        time_signatures=base.time_signatures,
+        provenance=base.provenance,
+        events=events,
+        segments=base.segments,
+    )
+    monkeypatch.setitem(
+        practice_module._PRACTICE_ANNOTATIONS,
+        lesson.content_id,
+        practice_module._PracticeAnnotation(
+            note_count=3,
+            melody=frozenset({0}),
+            essentials=frozenset({0, 1}),
+        ),
+    )
+    return lesson
+
+
+def test_practice_teach_shows_ghosts_but_only_emits_required_notes_across_loops(
     monkeypatch,
 ) -> None:
+    lesson = _practice_lesson(monkeypatch)
+    runtime = _runtime(StaticLessonService(lesson))
+    events = []
+    runtime.bus.subscribe(events.append)
+    pending = runtime.engine.coach_tool_start_lesson(
+        query="Test Melody", segment="main", practice_level="melody", loops=2
+    )
+    runtime.settle()
+
+    snapshot = runtime.engine.visualization_snapshot()
+    assert snapshot.practice_level == "melody"
+    assert (snapshot.required_note_count, snapshot.ghost_note_count) == (1, 2)
+    assert snapshot.target_notes == (60,)
+    assert {span.note for span in snapshot.spans if not span.required} == {61, 64}
+    assert [event.note for event in events] == [60]
+    assert [voice.note for voice in runtime.bus.active_voices(origin=MidiOrigin.HALCYON)] == [60]
+    state = runtime.engine.state().public["coach"]
+    assert state["practice_level"] == "melody"
+    assert state["required_note_count"] == 1
+    assert state["ghost_note_count"] == 2
+
+    runtime.advance_to(1_500_000_000)
+    assert runtime.engine.visualization_snapshot().current_loop == 1
+    runtime.advance_to(2_000_000_000)
+    assert pending.completion.result(timeout=0).status == "completed"
+    assert [(event.midi_event_type, event.note) for event in events] == [
+        ("note_on", 60),
+        ("note_off", 60),
+        ("note_on", 60),
+        ("note_off", 60),
+    ]
+    assert not runtime.engine.visualization_snapshot().active
+    assert runtime.bus.active_voices(origin=MidiOrigin.HALCYON) == ()
+    runtime.clock.now_ns = 10_000_000_000
+    runtime.scheduler.run_due(include_cancelled=True)
+    runtime.dispatcher.pump()
+    assert len(events) == 4
+
+
+def test_replay_and_attempt_preserve_or_change_practice_independently_of_tempo(monkeypatch) -> None:
+    runtime = _runtime(StaticLessonService(_practice_lesson(monkeypatch)))
+    taught = runtime.engine.coach_tool_start_lesson(
+        query="Test Melody", segment="main", practice_level="melody"
+    )
+    runtime.settle()
+    runtime.advance_to(1_500_000_000)
+    assert taught.completion.done()
+
+    replayed = runtime.engine.coach_tool_replay_lesson(tempo_percent=50)
+    snapshot = runtime.engine.visualization_snapshot()
+    assert snapshot.practice_level == "melody"
+    assert snapshot.tempo_percent == 50
+    assert (snapshot.required_note_count, snapshot.ghost_note_count) == (1, 2)
+    runtime.advance_to(2_500_000_000)
+    assert replayed.completion.done()
+
+    attempted = runtime.engine.coach_tool_start_attempt(
+        practice_level="essentials", tempo_percent=100, count_in=0
+    )
+    snapshot = runtime.engine.visualization_snapshot()
+    assert snapshot.phase == "capturing"
+    assert snapshot.practice_level == "essentials"
+    assert snapshot.tempo_percent == 100
+    assert snapshot.target_notes == (60, 61)
+    assert (snapshot.required_note_count, snapshot.ghost_note_count) == (2, 1)
+    human = MidiEventAdapter(origin=MidiOrigin.HUMAN, source_port="fixture://human")
+    runtime.bus.publish(human.note_on(60, 90))
+    runtime.bus.publish(human.note_on(61, 90))
+    runtime.advance_to(3_000_000_000)
+    assert attempted.completion.done()
+    metrics = attempted.completion.result(timeout=0).public["report"]["metrics"]
+    assert metrics["expected_note_count"] == 2
+    assert metrics["missed_count"] == 0
+
+    replayed = runtime.engine.replay(practice_level=PracticeLevel.FULL)
+    snapshot = runtime.engine.visualization_snapshot()
+    assert snapshot.practice_level == "full"
+    assert snapshot.tempo_percent == 100
+    assert (snapshot.required_note_count, snapshot.ghost_note_count) == (3, 0)
+    replayed.cancel()
+
+
+def test_practice_stop_cleans_required_voices_only_and_never_releases_ghosts(monkeypatch) -> None:
+    runtime = _runtime(StaticLessonService(_practice_lesson(monkeypatch)))
+    events = []
+    runtime.bus.subscribe(events.append)
+    pending = runtime.engine.coach_tool_start_lesson(
+        query="Test Melody", segment="main", practice_level="melody"
+    )
+    runtime.settle()
+    human = MidiEventAdapter(origin=MidiOrigin.HUMAN, source_port="fixture://human")
+    human_on = runtime.bus.publish(human.note_on(61, 100)).event
+
+    pending.cancel()
+
+    assert pending.completion.result(timeout=0).status == "cancelled"
+    halcyon_events = [event for event in events if event.origin is MidiOrigin.HALCYON]
+    assert [event.note for event in halcyon_events] == [60, 60]
+    assert runtime.bus.active_voices(origin=MidiOrigin.HALCYON) == ()
+    assert [voice.voice_id for voice in runtime.bus.active_voices(origin=MidiOrigin.HUMAN)] == [
+        human_on.voice_id
+    ]
+    runtime.clock.now_ns += 10_000_000_000
+    runtime.scheduler.run_due(include_cancelled=True)
+    runtime.dispatcher.pump()
+    assert len([event for event in events if event.origin is MidiOrigin.HALCYON]) == 2
+
+
+def test_trailing_ghosts_preserve_source_end_without_sound_or_key_targets(monkeypatch) -> None:
+    runtime = _runtime(StaticLessonService(_practice_lesson(monkeypatch, trailing_ghosts=True)))
+    events = []
+    runtime.bus.subscribe(events.append)
+    pending = runtime.engine.coach_tool_start_lesson(
+        query="Test Melody", segment="main", practice_level="melody"
+    )
+    runtime.settle()
+
+    runtime.advance_to(1_250_000_000)
+
+    snapshot = runtime.engine.visualization_snapshot()
+    assert snapshot.active and snapshot.phase == "demonstrating"
+    assert snapshot.target_notes == ()
+    assert any(not span.required for span in snapshot.spans)
+    assert not pending.completion.done()
+    assert runtime.bus.active_voices(origin=MidiOrigin.HALCYON) == ()
+    assert [(event.midi_event_type, event.note) for event in events] == [
+        ("note_on", 60),
+        ("note_off", 60),
+    ]
+
+    runtime.advance_to(1_500_000_000)
+    assert pending.completion.result(timeout=0).status == "completed"
+    assert not runtime.engine.visualization_snapshot().active
+    assert len(events) == 2
+
+
+def test_teach_terminalizes_after_demonstration_without_late_events_or_targets() -> None:
     lesson = _lesson()
     runtime = _runtime(StaticLessonService(lesson))
     observed_on_bus = []
     runtime.bus.subscribe(observed_on_bus.append)
-    captured_requests = []
-    real_score = engine_module.score_attempt
-
-    def capture_score(request):  # type: ignore[no-untyped-def]
-        captured_requests.append(request)
-        return real_score(request)
-
-    monkeypatch.setattr(engine_module, "score_attempt", capture_score)
     pending = _teach(runtime)
 
     assert runtime.engine.phase is CoachPhase.DEMONSTRATING
@@ -406,12 +580,68 @@ def test_teach_exact_playback_uses_one_anchor_bus_only_and_scores_human_capture(
     assert halcyon_on.scheduled_monotonic_ns == 1_000_000_000
 
     runtime.advance_to(1_500_000_000)
+    terminal = pending.completion.result(timeout=0)
+    snapshot = runtime.engine.visualization_snapshot()
+    session = runtime.engine._session
+
+    assert terminal.status == "completed"
+    assert terminal.public["code"] == "COACH_TEACH_COMPLETE"
+    assert terminal.public["coach"]["phase"] == "ready"
+    assert runtime.engine.phase is CoachPhase.READY
+    assert runtime.engine.transition_history[-2:] == (
+        CoachPhase.DEMONSTRATING,
+        CoachPhase.READY,
+    )
+    assert session is not None
+    assert session.timing_handle is None
+    assert session.playback_schedule is None
+    assert session.visualization_schedule is None
+    assert session.count_in_started_ns is None
+    assert session.count_in_deadline_ns is None
+    assert session.capture_started_ns is None
+    assert session.capture_ended_ns is None
+    assert session.attempt_id is None
+    assert runtime.bus.active_voices(origin=MidiOrigin.HALCYON) == ()
+    assert not snapshot.active
+    assert snapshot.phase == "ready"
+    assert snapshot.spans == ()
+    assert snapshot.target_notes == ()
+
+    event_count = len(observed_on_bus)
+    runtime.clock.now_ns = 10_000_000_000
+    runtime.scheduler.run_due(include_cancelled=True)
+    runtime.dispatcher.pump()
+
+    assert len(observed_on_bus) == event_count
+    assert runtime.engine.phase is CoachPhase.READY
+    assert runtime.bus.active_voices(origin=MidiOrigin.HALCYON) == ()
+
+
+def test_explicit_attempt_after_teach_uses_validated_schedule_and_scores_capture(
+    monkeypatch,
+) -> None:
+    lesson = _lesson()
+    runtime = _runtime(StaticLessonService(lesson))
+    captured_requests = []
+    real_score = engine_module.score_attempt
+
+    def capture_score(request):  # type: ignore[no-untyped-def]
+        captured_requests.append(request)
+        return real_score(request)
+
+    monkeypatch.setattr(engine_module, "score_attempt", capture_score)
+    taught = _teach(runtime)
+    runtime.advance_to(1_500_000_000)
+    assert taught.completion.result(timeout=0).public["code"] == "COACH_TEACH_COMPLETE"
+
+    runtime.clock.now_ns = 2_000_000_000
+    pending = runtime.engine.attempt(count_in=0)
     assert runtime.engine.phase is CoachPhase.CAPTURING
     human = MidiEventAdapter(origin=MidiOrigin.HUMAN, source_port="akai://lpk25")
     human_on = runtime.bus.publish(human.note_on(60, 90)).event
-    runtime.advance_to(1_900_000_000)
+    runtime.advance_to(2_400_000_000)
     human_off = runtime.bus.publish(human.note_off(60)).event
-    runtime.advance_to(2_000_000_000)
+    runtime.advance_to(2_500_000_000)
 
     terminal = pending.completion.result(timeout=0)
     assert terminal.status == "completed"
@@ -445,7 +675,7 @@ def test_ppq_remainder_schedule_has_no_loop_drift_and_drains_boundary_order(monk
         return real_resolve(*args)
 
     monkeypatch.setattr(engine_module, "resolve_loop_schedule", counted)
-    _teach(runtime, loops=3)
+    pending = _teach(runtime, loops=3)
     anchor = 1_000_000_000
 
     assert len(calls) == 1
@@ -458,9 +688,181 @@ def test_ppq_remainder_schedule_has_no_loop_drift_and_drains_boundary_order(monk
     assert runtime.scheduler.deadlines[-1] == anchor + 500_000_000
     runtime.advance_to(anchor + 500_000_000)
 
-    assert runtime.engine.phase is CoachPhase.CAPTURING
+    assert pending.completion.result(timeout=0).public["code"] == "COACH_TEACH_COMPLETE"
+    assert runtime.engine.phase is CoachPhase.READY
     assert len(calls) == 1
-    assert runtime.engine._session.capture_ended_ns == anchor + 666_667_000  # type: ignore[union-attr]
+
+
+def test_visualization_snapshot_uses_dispatch_schedule_anchor_and_loop_boundaries() -> None:
+    lesson = _lesson()
+    runtime = _runtime(StaticLessonService(lesson))
+    dispatched = []
+    runtime.bus.subscribe(dispatched.append)
+    _teach(runtime, loops=2)
+
+    first = runtime.engine.visualization_snapshot()
+    assert first.phase == "demonstrating"
+    assert first.presentation_anchor_ns == 1_000_000_000
+    assert first.presentation_deadline_ns == dispatched[0].scheduled_monotonic_ns
+    assert first.target_offset_us == 0
+    assert first.spans[0].start_offset_us == 0
+    assert first.current_loop == 0
+
+    runtime.clock.now_ns = 1_250_000_000
+    moving = runtime.engine.visualization_snapshot()
+    assert moving.spans[0].start_offset_us == -250_000
+    assert moving.spans[0].end_offset_us == 250_000
+
+    runtime.advance_to(1_500_000_000)
+    boundary = runtime.engine.visualization_snapshot()
+    loop_on = next(
+        event
+        for event in dispatched
+        if event.midi_event_type == "note_on" and event.scheduled_monotonic_ns == 1_500_000_000
+    )
+    assert boundary.phase == "demonstrating"
+    assert boundary.current_loop == 1
+    assert boundary.presentation_deadline_ns == loop_on.scheduled_monotonic_ns
+    assert boundary.target_offset_us == 0
+    assert next(span for span in boundary.spans if span.loop_index == 1).start_offset_us == 0
+
+
+def test_visualization_snapshot_count_in_capture_scoring_review_and_ready(monkeypatch) -> None:
+    runtime = _runtime(StaticLessonService(_lesson()))
+    scoring_samples = []
+    real_score = engine_module.score_attempt
+
+    def capture_scoring_snapshot(request):  # type: ignore[no-untyped-def]
+        scoring_samples.append(runtime.engine.visualization_snapshot())
+        return real_score(request)
+
+    monkeypatch.setattr(engine_module, "score_attempt", capture_scoring_snapshot)
+    taught = runtime.engine.teach(
+        LessonRequest(query="Test Melody", segment="main"),
+        count_in=4,
+    )
+    runtime.settle()
+    runtime.advance_to(1_500_000_000)
+    assert taught.completion.result(timeout=0).public["code"] == "COACH_TEACH_COMPLETE"
+    pending = runtime.engine.attempt(count_in=4)
+
+    count_in = runtime.engine.visualization_snapshot()
+    assert count_in.phase == "count_in"
+    assert count_in.count_in_remaining == 4
+    assert count_in.presentation_anchor_ns == 1_500_000_000
+    assert count_in.presentation_deadline_ns == 3_500_000_000
+    assert count_in.target_notes == (60,)
+    assert count_in.spans[0].start_offset_us == 0
+
+    runtime.clock.now_ns = 2_500_000_000
+    assert runtime.engine.visualization_snapshot().count_in_remaining == 2
+    runtime.advance_to(3_500_000_000)
+    capture = runtime.engine.visualization_snapshot()
+    assert capture.phase == "capturing"
+    assert capture.presentation_anchor_ns == 3_500_000_000
+    assert capture.presentation_deadline_ns == 3_500_000_000
+    assert capture.target_offset_us == 0
+
+    runtime.advance_to(4_000_000_000)
+    review = runtime.engine.visualization_snapshot()
+    assert scoring_samples[0].phase == "scoring"
+    assert scoring_samples[0].spans == ()
+    assert scoring_samples[0].target_notes == ()
+    assert review.phase == "review"
+    assert review.review is not None
+    assert review.review.status == "empty"
+    assert review.review.expected_note_count == 1
+    assert review.spans == ()
+    assert pending.completion.result(timeout=0).status == "completed"
+
+    replay = runtime.engine.replay()
+    runtime.advance_to(4_500_000_000)
+    ready = runtime.engine.visualization_snapshot()
+    assert replay.completion.result(timeout=0).status == "completed"
+    assert not ready.active
+    assert ready.phase == "ready"
+    assert ready.target_notes == ()
+    assert ready.target_offset_us is None
+
+
+def test_visualization_snapshot_resolving_authoring_and_terminal_phases_are_empty() -> None:
+    executor = QueuedExecutor()
+    runtime = _runtime(StaticLessonService(_lesson()), executor=executor)
+    pending = runtime.engine.teach(
+        LessonRequest(query="private prompt that must not leak", author=AuthorMode.BOUNDED),
+        count_in=0,
+    )
+
+    resolving = runtime.engine.visualization_snapshot()
+    assert resolving.active
+    assert resolving.phase == "resolving"
+    assert resolving.spans == ()
+    assert resolving.target_notes == ()
+    assert "private prompt" not in repr(resolving)
+
+    control = runtime.engine._worker_control
+    assert control is not None
+    control.checkpoint("authoring.provider")
+    runtime.advance_to(1_010_000_000)
+    authoring = runtime.engine.visualization_snapshot()
+    assert authoring.active
+    assert authoring.phase == "authoring"
+    assert authoring.spans == ()
+    assert authoring.target_notes == ()
+
+    pending.cancel()
+    runtime.settle()
+    terminal = runtime.engine.visualization_snapshot()
+    assert not terminal.active
+    assert terminal.phase == "cancelled"
+    assert terminal.spans == ()
+
+
+def test_visualization_snapshot_cancellation_is_active_but_clears_targets() -> None:
+    runtime = _runtime(StaticLessonService(_lesson()))
+    audio = ReceiptConsumer(default="pending")
+    runtime.bus.subscribe(audio, receipt_required=True)
+    pending = _teach(runtime)
+
+    pending.cancel()
+    cancelling = runtime.engine.visualization_snapshot()
+    assert cancelling.active
+    assert cancelling.phase == "cancelling"
+    assert cancelling.spans == ()
+    assert cancelling.target_notes == ()
+
+    for receipt in audio.receipts:
+        receipt.state = "accepted"
+    runtime.advance_to(runtime.clock.now_ns + engine_module.RECEIPT_POLL_NS)
+    cancelled = runtime.engine.visualization_snapshot()
+    assert pending.completion.result(timeout=0).status == "cancelled"
+    assert not cancelled.active
+    assert cancelled.phase == "cancelled"
+
+
+def test_visualization_snapshot_is_owner_thread_only_and_private() -> None:
+    runtime = _runtime(StaticLessonService(_lesson()))
+    _teach(runtime)
+    snapshot = runtime.engine.visualization_snapshot()
+    forbidden = (
+        "lesson_id",
+        "capture_events",
+        "source_port",
+        "prompt",
+        "receipt",
+        "operation_id",
+        "api_key",
+        "raw_message",
+    )
+
+    assert all(token not in repr(snapshot).lower() for token in forbidden)
+    errors = []
+    thread = threading.Thread(
+        target=lambda: _capture_error(runtime.engine.visualization_snapshot, errors)
+    )
+    thread.start()
+    thread.join(timeout=2)
+    assert isinstance(errors[0], RuntimeError)
 
 
 def test_replay_finishes_ready_and_each_playback_gets_fresh_runtime_identity() -> None:
@@ -470,7 +872,6 @@ def test_replay_finishes_ready_and_each_playback_gets_fresh_runtime_identity() -
     runtime.bus.subscribe(events.append)
     first = _teach(runtime)
     runtime.advance_to(1_500_000_000)
-    runtime.engine.feedback()
     assert first.completion.done()
 
     runtime.clock.now_ns = 3_000_000_000
@@ -488,8 +889,10 @@ def test_replay_finishes_ready_and_each_playback_gets_fresh_runtime_identity() -
 
 def test_feedback_ends_capture_early_and_retains_only_aggregate_report() -> None:
     runtime = _runtime(StaticLessonService(_lesson()), capture_tail_us=500_000)
-    pending = _teach(runtime)
+    taught = _teach(runtime)
     runtime.advance_to(1_500_000_000)
+    assert taught.completion.done()
+    pending = runtime.engine.attempt(count_in=0)
 
     feedback = runtime.engine.feedback()
 
@@ -506,8 +909,10 @@ def test_capture_filters_halcyon_and_window_restamps_without_republishing() -> N
     runtime = _runtime(StaticLessonService(_lesson()))
     published = []
     runtime.bus.subscribe(published.append)
-    pending = _teach(runtime)
+    taught = _teach(runtime)
     runtime.advance_to(1_500_000_000)
+    assert taught.completion.done()
+    pending = runtime.engine.attempt(count_in=0)
     before = len(published)
     outside = MidiEventAdapter(origin=MidiOrigin.HUMAN, source_port="human://outside")
     runtime.clock.now_ns = 1_499_999_999
@@ -524,8 +929,10 @@ def test_capture_filters_halcyon_and_window_restamps_without_republishing() -> N
 
 def test_capture_cap_is_sticky_and_cancel_discards_raw_events() -> None:
     runtime = _runtime(StaticLessonService(_lesson()))
-    pending = _teach(runtime)
+    taught = _teach(runtime)
     runtime.advance_to(1_500_000_000)
+    assert taught.completion.done()
+    pending = runtime.engine.attempt(count_in=0)
     human = MidiEventAdapter(origin=MidiOrigin.HUMAN, source_port="human://many")
     for note_index in range(2_049):
         runtime.bus.publish(human.note_on(note_index % 128, 1))
@@ -622,15 +1029,15 @@ def test_playback_waits_for_every_required_receipt_on_owner_scheduler() -> None:
     consumer.receipts[1].state = "accepted"
     runtime.advance_to(1_510_000_000)
 
-    assert runtime.engine.phase is CoachPhase.CAPTURING
-    assert not pending.completion.done()
+    assert runtime.engine.phase is CoachPhase.READY
+    assert pending.completion.done()
+    assert pending.completion.result(timeout=0).public["code"] == "COACH_TEACH_COMPLETE"
     assert all(
         poll_thread == owner_thread
         for receipt in consumer.receipts
         for poll_thread in receipt.poll_threads
     )
     assert "receipt" not in repr(runtime.engine.state().public).lower()
-    pending.cancel()
 
 
 def test_timeout_waits_for_pending_cleanup_acceptance_and_preserves_human_same_note() -> None:
@@ -780,7 +1187,6 @@ def test_post_terminal_cleanup_barrier_rejects_every_replacement_entry() -> None
     runtime.bus.subscribe(audio, receipt_required=True)
     taught = _teach(runtime)
     runtime.advance_to(1_500_000_000)
-    runtime.engine.feedback()
     assert taught.completion.done()
 
     session = runtime.engine._session
@@ -1043,13 +1449,11 @@ def test_late_timeout_loses_commit_fence_and_successful_teach_completes() -> Non
         assert runtime.engine.phase is CoachPhase.DEMONSTRATING
 
         runtime.advance_to(runtime.clock.now_ns + 500_000_000)
-        assert runtime.engine.phase is CoachPhase.CAPTURING
-        runtime.advance_to(runtime.clock.now_ns + 500_000_000)
 
         terminal = pending.completion.result(timeout=0)
         assert terminal.status == "completed"
-        assert terminal.public["code"] == "COACH_ATTEMPT_COMPLETE"
-        assert runtime.engine.phase is CoachPhase.REVIEW
+        assert terminal.public["code"] == "COACH_TEACH_COMPLETE"
+        assert runtime.engine.phase is CoachPhase.READY
         assert CoachPhase.CANCELLED not in runtime.engine.transition_history
         assert runtime.bus.release_calls == 0
     finally:
@@ -1149,13 +1553,11 @@ def test_scheduler_exceptions_fail_playback_capture_or_count_in_without_strandin
     scheduler = RaisingScheduler(runtime.clock, fail_at_call=fail_at_call)
     runtime.scheduler = scheduler
     runtime.engine._scheduler = scheduler
-    pending = runtime.engine.teach(
-        LessonRequest(query="Test Melody", segment="main"),
-        count_in=count_in,
-    )
+    taught = runtime.engine.teach(LessonRequest(query="Test Melody", segment="main"))
     runtime.settle()
-    if not pending.completion.done():
+    if not taught.completion.done():
         runtime.advance_to(1_500_000_000)
+    pending = taught if fail_at_call == 1 else runtime.engine.attempt(count_in=count_in)
 
     terminal = pending.completion.result(timeout=0)
     assert terminal.status == "failed"
@@ -1184,9 +1586,9 @@ def test_synchronous_reentrant_scheduler_cannot_overwrite_newer_handle_or_strand
     )
 
     assert pending.completion.result(timeout=0).status == "completed"
-    assert engine.phase is CoachPhase.REVIEW
+    assert engine.phase is CoachPhase.READY
     assert engine._session.timing_handle is None  # type: ignore[union-attr]
-    assert scheduler.calls == 2
+    assert scheduler.calls == 1
 
 
 def test_synchronous_scheduler_trampolines_pending_receipts_then_resumes_on_acceptance() -> None:
@@ -1224,7 +1626,7 @@ def test_synchronous_scheduler_trampolines_pending_receipts_then_resumes_on_acce
     engine.state()
 
     assert pending.completion.result(timeout=0).status == "completed"
-    assert engine.phase is CoachPhase.REVIEW
+    assert engine.phase is CoachPhase.READY
     assert not session.receipt_poll_deferred
     assert not session.receipt_poll_in_callback
 
@@ -1233,8 +1635,10 @@ def test_count_in_uses_one_rational_duration_and_allocates_fresh_attempt_identit
     runtime = _runtime(StaticLessonService(_lesson()))
     first = _teach(runtime)
     runtime.advance_to(1_500_000_000)
+    first_attempt = runtime.engine.attempt(count_in=0)
     first_feedback = runtime.engine.feedback()
     assert first.completion.done()
+    assert first_attempt.completion.done()
     first_attempt_id = first_feedback.public["report"]["attempt_id"]
 
     runtime.clock.now_ns = 3_000_000_000
@@ -1251,6 +1655,7 @@ def test_nested_report_envelopes_are_copies_not_mutable_engine_storage() -> None
     runtime = _runtime(StaticLessonService(_lesson()))
     _teach(runtime)
     runtime.advance_to(1_500_000_000)
+    runtime.engine.attempt(count_in=0)
     feedback = runtime.engine.feedback().public
     original_status = feedback["report"]["status"]
     feedback["report"]["status"] = "tampered"
@@ -1315,7 +1720,6 @@ def test_attempt_count_in_zero_is_immediate_and_reports_are_bounded_to_five() ->
     runtime = _runtime(StaticLessonService(_lesson()))
     first = _teach(runtime)
     runtime.advance_to(1_500_000_000)
-    runtime.engine.feedback()
     assert first.completion.done()
 
     for index in range(6):

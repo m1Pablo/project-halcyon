@@ -6,8 +6,9 @@ from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import Future
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import json
 import math
 import re
 import threading
@@ -15,11 +16,13 @@ import time
 from typing import Any, Literal
 import uuid
 
+from halcyon.assistant import render_command_terminal
 from halcyon.command_executor import (
     CommandProgress,
     PendingCommandOutcome,
     TerminalCommandOutcome,
 )
+from halcyon.console_events import ConsoleEvent
 
 RunState = Literal["queued", "running", "completed", "failed", "cancelled", "timed_out"]
 TerminalRunState = Literal["completed", "failed", "cancelled", "timed_out"]
@@ -202,6 +205,7 @@ class RunRecord:
     status: RunState
     created_at: str
     timeout_s: float
+    parent_run_id: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
@@ -213,12 +217,14 @@ class RunRecord:
     result: dict[str, Any] | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     events_truncated: bool = False
+    events_total: int = 0
     explicit_failure: bool = False
     pending_cancel: Callable[[Literal["stop", "timeout"]], bool] | None = field(
         default=None,
         repr=False,
     )
     pending_authoritative: bool = field(default=False, repr=False)
+    pending_completion: Future[TerminalCommandOutcome] | None = field(default=None, repr=False)
     progress_unsubscribe: Callable[[], None] | None = field(default=None, repr=False)
 
     def as_status_payload(self) -> dict[str, Any]:
@@ -236,6 +242,8 @@ class RunRecord:
             "session_id": self.session_id,
             "cancellation_requested": self.cancellation_requested,
         }
+        if self.parent_run_id is not None:
+            payload["parent_run_id"] = self.parent_run_id
         if self.accepted is not None:
             payload["accepted"] = copy.deepcopy(self.accepted)
         if self.result is not None:
@@ -265,6 +273,110 @@ class RunTracker:
         self._clock = clock
         self._now_iso = now_iso
         self._lock = threading.RLock()
+        self._console_observers: dict[
+            str, tuple[Callable[[ConsoleEvent], None], threading.RLock]
+        ] = {}
+        self._console_notifications: deque[tuple[ConsoleEvent, tuple[str, ...]]] = deque(
+            maxlen=1_000
+        )
+        self._console_notifying = False
+
+    def subscribe(self, callback: Callable[[ConsoleEvent], None]) -> Callable[[], None]:
+        """Observe future presentation events; never expose them through MCP payloads."""
+        token = uuid.uuid4().hex
+        delivery_lock = threading.RLock()
+        with self._lock:
+            self._console_observers[token] = (callback, delivery_lock)
+
+        def unsubscribe() -> None:
+            # Wait for an in-flight callback, but never hold the tracker lock while
+            # waiting. After return no callback can begin for this subscription.
+            with delivery_lock:
+                with self._lock:
+                    self._console_observers.pop(token, None)
+
+        return unsubscribe
+
+    def _queue_console_event_locked(
+        self,
+        record: RunRecord,
+        *,
+        event: dict[str, Any] | None = None,
+        console_details: str | None = None,
+    ) -> None:
+        if not self._console_observers:
+            return
+        level = str((event or {}).get("level", "INFO")).lower()
+        severity = "error" if level in {"error", "critical"} else level
+        if severity not in {"debug", "info", "warning", "error"}:
+            severity = "info"
+        if event is None and record.status in {"failed", "timed_out"}:
+            severity = "error"
+        elif event is None and record.status == "cancelled":
+            severity = "warning"
+        details = event if event is not None else record.result or record.accepted
+        rendered_details = json.dumps(details, ensure_ascii=False) if details else record.error
+        if console_details:
+            rendered_details = console_details + (
+                f"\n\n{rendered_details}" if rendered_details else ""
+            )
+        self._console_notifications.append(
+            (
+                ConsoleEvent(
+                    event_id=uuid.uuid4().hex,
+                    kind="log" if event is not None else "command",
+                    role="assistant" if record.source == "llm" else "client",
+                    source=record.source,
+                    text=str(event.get("message", event.get("kind", "Progress")))
+                    if event is not None
+                    else record.command,
+                    severity=severity,
+                    run_id=record.run_id,
+                    parent_run_id=record.parent_run_id,
+                    session_id=record.session_id,
+                    operation_id=record.operation_id,
+                    status=record.status,
+                    details=rendered_details,
+                ),
+                tuple(self._console_observers),
+            )
+        )
+
+    def _notify_console(self) -> None:
+        # Synchronous drain, not a background queue. Reentrant callbacks may append
+        # more events; this owner drains them in order after releasing the lock.
+        with self._lock:
+            if self._console_notifying:
+                return
+            self._console_notifying = True
+        try:
+            while True:
+                with self._lock:
+                    if not self._console_notifications:
+                        self._console_notifying = False
+                        return
+                    event, tokens = self._console_notifications.popleft()
+                    observers = tuple(
+                        (token, self._console_observers[token])
+                        for token in tokens
+                        if token in self._console_observers
+                    )
+                for token, subscription in observers:
+                    callback, delivery_lock = subscription
+                    with delivery_lock:
+                        with self._lock:
+                            active = self._console_observers.get(token) is subscription
+                        if not active:
+                            continue
+                        try:
+                            callback(event)
+                        except Exception:
+                            # Presentation cannot change execution authority.
+                            pass
+        except BaseException:
+            with self._lock:
+                self._console_notifying = False
+            raise
 
     @staticmethod
     def _is_terminal(state: RunState) -> bool:
@@ -276,7 +388,13 @@ class RunTracker:
         return level in {"ERROR", "CRITICAL"}
 
     def create_run(
-        self, *, command: str, source: str, timeout_s: float = 300.0
+        self,
+        *,
+        command: str,
+        source: str,
+        timeout_s: float = 300.0,
+        parent_run_id: str | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         timeout_value = _validated_timeout(timeout_s)
         self._service_timeouts()
@@ -296,11 +414,14 @@ class RunTracker:
                     status="queued",
                     created_at=created_at,
                     timeout_s=timeout_value,
+                    parent_run_id=parent_run_id,
+                    session_id=session_id,
                     deadline_monotonic=deadline,
                 )
                 self._runs[run_id] = record
                 self._active_run_ids.add(run_id)
                 payload = record.as_status_payload()
+                self._queue_console_event_locked(record)
         self._call_unsubscribes(unsubscribes)
         if not admitted or payload is None:
             raise RuntimeError(_CAPACITY_ERROR)
@@ -320,10 +441,14 @@ class RunTracker:
             record.accepted = _bounded_payload(pending.accepted)
             record.pending_cancel = pending.cancel
             record.pending_authoritative = True
+            record.pending_completion = pending.completion
             if record.started_at is None:
                 record.started_at = self._now_iso()
             record.status = "running"
             self._active_run_ids.add(run_id)
+
+            self._queue_console_event_locked(record)
+        self._notify_console()
 
         try:
             pending.completion.add_done_callback(
@@ -335,7 +460,7 @@ class RunTracker:
                 )
             )
         except Exception:
-            self._fail_invalid_pending(run_id, operation_id, session_id)
+            self._fail_invalid_pending(run_id, operation_id, session_id, pending.completion)
             return True
 
         with self._lock:
@@ -388,9 +513,13 @@ class RunTracker:
                 return False
             if record.started_at is None:
                 record.started_at = self._now_iso()
+            changed = record.status != "running"
             record.status = "running"
             self._active_run_ids.add(run_id)
-            return True
+            if changed:
+                self._queue_console_event_locked(record)
+        self._notify_console()
+        return True
 
     def mark_failed(
         self,
@@ -411,6 +540,7 @@ class RunTracker:
                 run_id,
                 status="failed",
                 error=error,
+                console_details=_coach_console_summary(record, result, status="failed"),
             )
         self._call_unsubscribes([unsubscribe] if unsubscribe is not None else [])
         return changed
@@ -480,12 +610,14 @@ class RunTracker:
                 changed, unsubscribe = self._set_terminal_locked(
                     run_id,
                     status="completed",
+                    console_details=_coach_console_summary(record, result, status="completed"),
                 )
             else:
                 changed, unsubscribe = self._set_terminal_locked(
                     run_id,
                     status="failed",
                     error=record.error or "Command failed.",
+                    console_details=_coach_console_summary(record, result, status="failed"),
                 )
         self._call_unsubscribes([unsubscribe] if unsubscribe is not None else [])
         return changed
@@ -497,6 +629,7 @@ class RunTracker:
             self._global_events.append(payload)
             for run_id in self._resolve_target_run_ids_locked(payload):
                 self._append_event_locked(run_id, payload)
+        self._notify_console()
 
     def get_status(self, run_id: str) -> dict[str, Any] | None:
         self._service_timeouts()
@@ -514,7 +647,44 @@ class RunTracker:
                 **record.as_status_payload(),
                 "events": copy.deepcopy(record.events),
                 "truncated": record.events_truncated,
+                "next_cursor": record.events_total,
+                "first_cursor": record.events_total - len(record.events),
             }
+
+    def wait_for_run(
+        self, run_id: str, *, cursor: int = 0, max_wait_s: float = 0.0
+    ) -> dict[str, Any] | None:
+        """Bounded incremental wait. Call only off the UI thread."""
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ValueError("cursor must be a nonnegative integer")
+        if (
+            isinstance(max_wait_s, bool)
+            or not isinstance(max_wait_s, (int, float))
+            or not math.isfinite(max_wait_s)
+            or not 0 <= max_wait_s <= 10
+        ):
+            raise ValueError("max_wait_s must be between 0 and 10")
+        deadline = time.monotonic() + max_wait_s
+        while True:
+            payload = self.get_logs(run_id)
+            if payload is None:
+                return None
+            terminal = payload["status"] in TERMINAL_RUN_STATES
+            if terminal or payload["next_cursor"] > cursor or time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        first = payload.pop("first_cursor")
+        payload["events"] = payload["events"][max(0, cursor - first) :]
+        payload["cursor_truncated"] = cursor < first
+        payload["terminal"] = terminal
+        result = payload.get("result") or {}
+        payload["verdict"] = {
+            "errors": [payload["error"]] if payload.get("error") else [],
+            "warnings": result.get("warnings", []),
+            "needs_attention": payload["status"] in {"failed", "cancelled", "timed_out"}
+            or bool(result.get("warnings")),
+        }
+        return payload
 
     def get_state(self) -> dict[str, Any]:
         self._service_timeouts()
@@ -545,7 +715,8 @@ class RunTracker:
         with self._lock:
             record = self._runs.get(run_id)
             if (
-                not self._pending_matches_locked(record, operation_id, session_id)
+                not isinstance(progress, CommandProgress)
+                or not self._pending_matches_locked(record, operation_id, session_id)
                 or progress.operation_id != operation_id
                 or progress.session_id != session_id
             ):
@@ -559,6 +730,7 @@ class RunTracker:
                     **progress.to_public_dict(),
                 },
             )
+        self._notify_console()
 
     def _settle_pending(
         self,
@@ -567,6 +739,16 @@ class RunTracker:
         session_id: str,
         future: Future[TerminalCommandOutcome],
     ) -> None:
+        with self._lock:
+            record = self._runs.get(run_id)
+            if (
+                not self._pending_matches_locked(record, operation_id, session_id)
+                or record is None
+                or record.pending_completion is not future
+            ):
+                return
+        if not future.done():
+            return
         try:
             terminal = future.result()
             if (
@@ -576,13 +758,17 @@ class RunTracker:
             ):
                 raise TypeError("pending completion returned an invalid terminal outcome")
         except Exception:
-            self._fail_invalid_pending(run_id, operation_id, session_id)
+            self._fail_invalid_pending(run_id, operation_id, session_id, future)
             return
 
         unsubscribe: Callable[[], None] | None = None
         with self._lock:
             record = self._runs.get(run_id)
-            if not self._pending_matches_locked(record, operation_id, session_id):
+            if (
+                not self._pending_matches_locked(record, operation_id, session_id)
+                or record is None
+                or record.pending_completion is not future
+            ):
                 return
             assert record is not None
             record.result = _bounded_payload(terminal.public)
@@ -594,6 +780,7 @@ class RunTracker:
                 run_id,
                 status=status,
                 error=error,
+                console_details=_coach_console_summary(record, replace(terminal, status=status)),
             )
         self._call_unsubscribes([unsubscribe] if unsubscribe is not None else [])
 
@@ -602,11 +789,16 @@ class RunTracker:
         run_id: str,
         operation_id: str,
         session_id: str,
+        future: Future[TerminalCommandOutcome],
     ) -> None:
         unsubscribe: Callable[[], None] | None = None
         with self._lock:
             record = self._runs.get(run_id)
-            if not self._pending_matches_locked(record, operation_id, session_id):
+            if (
+                not self._pending_matches_locked(record, operation_id, session_id)
+                or record is None
+                or record.pending_completion is not future
+            ):
                 return
             assert record is not None
             record.result = {
@@ -643,6 +835,7 @@ class RunTracker:
                     "message": "Progress subscription is unavailable; terminal tracking continues.",
                 },
             )
+        self._notify_console()
 
     def _service_timeouts(self) -> None:
         actions: list[tuple[str, Callable[[Literal["stop", "timeout"]], bool]]] = []
@@ -728,6 +921,7 @@ class RunTracker:
                     ),
                 },
             )
+        self._notify_console()
 
     def _set_terminal_locked(
         self,
@@ -735,6 +929,7 @@ class RunTracker:
         *,
         status: TerminalRunState,
         error: str | None = None,
+        console_details: str | None = None,
     ) -> tuple[bool, Callable[[], None] | None]:
         record = self._runs.get(run_id)
         if record is None or self._is_terminal(record.status):
@@ -746,8 +941,22 @@ class RunTracker:
             record.explicit_failure = True
         record.pending_cancel = None
         record.pending_authoritative = False
+        record.pending_completion = None
         unsubscribe = self._take_unsubscribe_locked(record)
         self._active_run_ids.discard(run_id)
+        self._queue_console_event_locked(record, console_details=console_details)
+        if console_details:
+            self._queue_console_event_locked(
+                record,
+                event={
+                    "message": console_details,
+                    "level": "ERROR"
+                    if status in {"failed", "timed_out"}
+                    else "WARNING"
+                    if status == "cancelled"
+                    else "INFO",
+                },
+            )
         return True, unsubscribe
 
     def _append_event_locked(self, run_id: str, event: dict[str, Any]) -> None:
@@ -759,6 +968,8 @@ class RunTracker:
         if self._event_is_error(payload):
             record.explicit_failure = True
         record.events.append(payload)
+        record.events_total += 1
+        self._queue_console_event_locked(record, event=payload)
         if len(record.events) > self._max_events_per_run:
             overflow = len(record.events) - self._max_events_per_run
             del record.events[:overflow]
@@ -806,13 +1017,13 @@ class RunTracker:
         record.progress_unsubscribe = None
         return unsubscribe
 
-    @staticmethod
-    def _call_unsubscribes(unsubscribes: list[Callable[[], None]]) -> None:
+    def _call_unsubscribes(self, unsubscribes: list[Callable[[], None]]) -> None:
         for unsubscribe in unsubscribes:
             try:
                 unsubscribe()
             except Exception:
                 continue
+        self._notify_console()
 
     def _extract_run_id_from_event_locked(self, event: dict[str, Any]) -> str | None:
         explicit = str(event.get("run_id", "")).strip().lower()
@@ -937,13 +1148,28 @@ def _bounded_report_lesson(value: object) -> dict[str, Any] | None:
         return None
     if not _integer_in_range(tempo_percent, 25, 200):
         return None
-    return {
+    bounded = {
         "lesson_id": lesson_id,
         "revision_id": revision_id,
         "content_id": content_id,
         "segment_label": segment_label,
         "tempo_percent": tempo_percent,
     }
+    if "practice_level" in value:
+        practice_level = value["practice_level"]
+        if not isinstance(practice_level, str) or practice_level not in {
+            "melody",
+            "essentials",
+            "full",
+        }:
+            return None
+        bounded["practice_level"] = practice_level
+    if "ghost_note_count" in value:
+        ghost_note_count = value["ghost_note_count"]
+        if not _integer_in_range(ghost_note_count, 0, 2_048):
+            return None
+        bounded["ghost_note_count"] = ghost_note_count
+    return bounded
 
 
 def _bounded_report_metrics(value: object) -> dict[str, Any] | None:
@@ -1157,6 +1383,29 @@ def _bounded_coaching_report(value: object, *, depth: int) -> dict[str, Any] | N
     }
 
 
+def _coach_console_summary(
+    record: RunRecord,
+    outcome: TerminalCommandOutcome | dict[str, Any] | None,
+    *,
+    status: TerminalRunState | None = None,
+) -> str | None:
+    if not record.command.startswith("/coach ") or outcome is None:
+        return None
+    if isinstance(outcome, TerminalCommandOutcome):
+        status = outcome.status
+        payload = outcome.public
+    else:
+        payload = outcome
+    if status != "completed" and payload.get("ok"):
+        return None
+    try:
+        # UI-only whitelist projection before strict public report validation.
+        # Never store this string in the record or a public result/log payload.
+        return render_command_terminal(outcome)
+    except Exception:
+        return None
+
+
 def _bounded_payload(value: Any, *, depth: int = 0) -> Any:
     if depth >= 6:
         return "..."
@@ -1173,6 +1422,9 @@ def _bounded_payload(value: Any, *, depth: int = 0) -> Any:
                     bounded[key] = report
                 continue
             if _private_normalized_payload_key(normalized):
+                continue
+            if normalized == "reply" and isinstance(item, str):
+                bounded[key] = item[:2_000]
                 continue
             bounded[key] = _bounded_payload(item, depth=depth + 1)
         return bounded

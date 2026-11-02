@@ -27,16 +27,19 @@ BLACK_IDLE_STYLE = "#fcfcfa on #090b10"
 WHITE_IDLE_STYLE = "#090b10 on #fcfcfa"
 BLACK_PRESSED_STYLE = "bold #090b10 on #ff9f43"
 WHITE_PRESSED_STYLE = "bold #090b10 on #ff9f43"
-BLACK_HALCYON_STYLE = "bold #090b10 on #ab9df2"
+BLACK_HALCYON_STYLE = "bold #090b10 on #78dce8"
 WHITE_HALCYON_STYLE = "bold #090b10 on #ab9df2"
 BLACK_TARGET_STYLE = "bold #090b10 on #78dce8"
-WHITE_TARGET_STYLE = "bold #090b10 on #78dce8"
+WHITE_TARGET_STYLE = "bold #090b10 on #ab9df2"
 COMBINED_STATE_STYLE = "bold #090b10 on #ffd866"
 HUMAN_MARKER_STYLE = "bold #ff9f43 on #11151d"
-HALCYON_MARKER_STYLE = "bold #ab9df2 on #11151d"
+NATURAL_HALCYON_MARKER_STYLE = "bold #ab9df2 on #11151d"
+SHARP_HALCYON_MARKER_STYLE = "bold #78dce8 on #11151d"
+HALCYON_MARKER_STYLE = NATURAL_HALCYON_MARKER_STYLE
 BOTH_MARKER_STYLE = "bold #ffd866 on #11151d"
-TARGET_MARKER_STYLE = "bold #78dce8 on #11151d"
-LEGEND_TEXT = "● YOU   ◆ HALCYON   ●◆ BOTH   ○ NEXT"
+NATURAL_TARGET_MARKER_STYLE = "bold #ab9df2 on #11151d"
+SHARP_TARGET_MARKER_STYLE = "bold #78dce8 on #11151d"
+TARGET_MARKER_STYLE = NATURAL_TARGET_MARKER_STYLE
 
 
 @dataclass(frozen=True)
@@ -211,9 +214,19 @@ def key_markers(
     elif human:
         markers.append(("●", HUMAN_MARKER_STYLE))
     elif halcyon:
-        markers.append(("◆", HALCYON_MARKER_STYLE))
+        markers.append(
+            (
+                "◆",
+                SHARP_HALCYON_MARKER_STYLE if is_black_note(note) else NATURAL_HALCYON_MARKER_STYLE,
+            )
+        )
     if note in target_notes:
-        markers.append(("○", TARGET_MARKER_STYLE))
+        markers.append(
+            (
+                "○",
+                SHARP_TARGET_MARKER_STYLE if is_black_note(note) else NATURAL_TARGET_MARKER_STYLE,
+            )
+        )
     return tuple(markers)
 
 
@@ -284,26 +297,6 @@ def _draw_frame(grid: list[list[tuple[str, str]]], *, width: int) -> None:
     _set_cell(grid[0], index=width - 1, char="┐", style=FRAME_STYLE)
     _set_cell(grid[KEYBOARD_HEIGHT - 1], index=0, char="└", style=FRAME_STYLE)
     _set_cell(grid[KEYBOARD_HEIGHT - 1], index=width - 1, char="┘", style=FRAME_STYLE)
-
-
-def _draw_legend(grid: list[list[tuple[str, str]]], *, width: int) -> None:
-    legend_left = max(2, (width - len(LEGEND_TEXT)) // 2)
-    legend_parts = (
-        ("● YOU", HUMAN_MARKER_STYLE),
-        ("   ◆ HALCYON", HALCYON_MARKER_STYLE),
-        ("   ●◆ BOTH", BOTH_MARKER_STYLE),
-        ("   ○ NEXT", TARGET_MARKER_STYLE),
-    )
-    offset = 0
-    for label, style in legend_parts:
-        for char in label:
-            _set_cell(
-                grid[0],
-                index=legend_left + offset,
-                char=char,
-                style=style,
-            )
-            offset += 1
 
 
 def _draw_white_keys(
@@ -440,8 +433,6 @@ def keyboard_text(
         halcyon_notes=halcyon_notes,
         target_notes=target_notes,
     )
-    _draw_legend(grid, width=width)
-
     text = Text()
     for row_index, row in enumerate(grid):
         if row_index:

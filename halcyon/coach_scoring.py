@@ -240,6 +240,8 @@ class CoachingReport:
     issues: tuple[CoachingIssue, ...]
     tips: tuple[str, ...]
     recommendation: PracticeRecommendation
+    practice_level: str = "full"
+    ghost_note_count: int = 0
 
     def to_public_dict(self) -> dict[str, object]:
         """Return a JSON-safe aggregate envelope with hard-bounded collections."""
@@ -255,6 +257,8 @@ class CoachingReport:
                 "content_id": self.content_id,
                 "segment_label": self.segment_label,
                 "tempo_percent": self.tempo_percent,
+                "practice_level": self.practice_level,
+                "ghost_note_count": self.ghost_note_count,
             },
             "metrics": self.metrics.to_public_dict(),
             "latency": self.latency.to_public_dict(),
@@ -272,6 +276,7 @@ class _ExpectedNote:
     onset_us: int
     absolute_tick: int
     duration_us: int | None = None
+    required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,8 +310,9 @@ def score_attempt(
         )
 
     expected = _pair_expected_notes(request.timeline.events)
+    required = tuple(note for note in expected if note.required)
     observed = _pair_observed_notes(request)
-    latency = _latency_estimate(expected, observed, request.latency_profile, config)
+    latency = _latency_estimate(required, observed, request.latency_profile, config)
     adjusted = tuple(replace(note, onset_us=note.onset_us - latency.offset_us) for note in observed)
     alignment = _align_notes(expected, adjusted, latency.tolerance_us, config)
 
@@ -315,6 +321,8 @@ def score_attempt(
     missed: list[_ExpectedNote] = []
     extras: list[_ObservedNote] = []
     for step in alignment:
+        if step.expected is not None and not step.expected.required:
+            continue
         if step.kind == "missed":
             assert step.expected is not None
             missed.append(step.expected)
@@ -343,7 +351,7 @@ def score_attempt(
         if expected_note.duration_us is not None and observed_note.duration_us is None
     )
 
-    expected_count = len(expected)
+    expected_count = len(required)
     correct_count = len(exact_pairs)
     pitch_denominator = expected_count + len(extras)
     pitch_accuracy = _percent(correct_count, pitch_denominator)
@@ -414,6 +422,8 @@ def score_attempt(
         issues=issues,
         tips=tips,
         recommendation=recommendation,
+        practice_level=request.timeline.practice_level.value,
+        ghost_note_count=len(expected) - len(required),
     )
 
 
@@ -444,6 +454,7 @@ def _pair_expected_notes(events: tuple[ResolvedLessonEvent, ...]) -> tuple[_Expe
                     channel=event.channel,
                     onset_us=event.absolute_us,
                     absolute_tick=event.absolute_tick,
+                    required=event.required,
                 )
             )
         elif event.event_type == "note_off" and active[key]:
@@ -620,17 +631,25 @@ def _align_notes(
         directions[observed_index] = 2
 
     for expected_index in range(1, expected_count + 1):
-        current = [expected_index * gap_cost] + [0] * observed_count
-        directions[expected_index * width] = 1
         expected_note = expected_ordered[expected_index - 1]
+        delete_cost = gap_cost if expected_note.required else 0
+        current = [previous[0] + delete_cost] + [0] * observed_count
+        directions[expected_index * width] = 1
         for observed_index in range(1, observed_count + 1):
             observed_note = observed_ordered[observed_index - 1]
-            diagonal = previous[observed_index - 1] + _pair_cost(
-                expected_note,
-                observed_note,
-                tolerance_us,
-            )
-            delete = previous[observed_index] + gap_cost
+            if expected_note.required:
+                pair_cost = _pair_cost(expected_note, observed_note, tolerance_us)
+            elif (
+                expected_note.note == observed_note.note
+                and abs(expected_note.onset_us - observed_note.onset_us) <= tolerance_us
+            ):
+                pair_cost = 0
+            else:
+                # A ghost can consume a timely exact performance, never explain
+                # a wrong pitch or absorb an unrelated extra at another time.
+                pair_cost = 10**12
+            diagonal = previous[observed_index - 1] + pair_cost
+            delete = previous[observed_index] + delete_cost
             insert = current[observed_index - 1] + gap_cost
             if diagonal <= delete and diagonal <= insert:
                 current[observed_index] = diagonal

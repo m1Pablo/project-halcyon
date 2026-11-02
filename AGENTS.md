@@ -37,8 +37,8 @@ Near-term target:
 - The next iteration adds Rust sound output through `halcyon-audio/`; Python remains the MIDI/UI control plane.
 - Current synth controls are Python-owned patch state streamed to Rust via `set_param`; keep the parameter registry in `halcyon/synth_params.py` as the UI/tooling source of truth.
 - User synth presets are saved outside the repository through `halcyon/preset_store.py`.
-- `halcyon/menu.xml` is the public command ABI for chat and MCP. The OpenAI assistant may only route natural language to registered slash commands or reject; it must not call raw synth tools directly.
-- The local MCP bridge may only expose command-control tools: `list_commands`, `run_slash_command`, `get_run_status`, `get_run_logs`, and `get_app_state`. Safe synth tools in `halcyon/mcp_tools.py` remain internal slash-command leaves, including preset save/load but no shell, file, MIDI-device, or arbitrary network access.
+- `halcyon/menu.xml` is the public command ABI for chat and MCP. The shared conversational assistant may read bounded app state and execute validated registered slash commands, inspect their results, and adapt; it must not call raw synth tools or recursively ask itself.
+- The local MCP bridge exposes command control plus the shared assistant: `list_commands`, `run_slash_command`, `get_run_status`, `get_run_logs`, `get_app_state`, `ask_tui`, and `wait_for_run`. `ask_tui` delegates through `/assistant ask`; chat uses the same tracked service. Safe synth tools in `halcyon/mcp_tools.py` remain internal slash-command leaves, including preset save/load but no shell, file, MIDI-device, or arbitrary network access.
 
 ## Validation Policy
 
