@@ -12,6 +12,7 @@ from typing import Any
 
 NOTE_OFF = 0x80
 NOTE_ON = 0x90
+HALCYON_PLAYBACK_VELOCITY_SCALE = 0.5
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 PREFERRED_PORT_TERMS = ("lpk25", "akai", "wireless")
 EVENT_TYPE_ALIASES = {
@@ -296,10 +297,15 @@ def audio_command_for_event(event: MidiEvent) -> dict[str, int | str] | None:
     """Translate a normalized MIDI event into the Rust sidecar IPC schema."""
 
     if event.is_press:
+        # The engine maps velocity to amplitude. Attenuate only the outgoing
+        # demonstration audio; preserve source events for display and scoring.
+        velocity = event.velocity
+        if event.origin is MidiOrigin.HALCYON:
+            velocity = max(1, round(velocity * HALCYON_PLAYBACK_VELOCITY_SCALE))
         return {
             "type": "note_on",
             "note": event.note,
-            "velocity": event.velocity,
+            "velocity": velocity,
             "channel": event.channel,
             "voice_id": event.voice_id,
         }

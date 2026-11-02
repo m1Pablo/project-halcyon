@@ -232,6 +232,248 @@ def test_closing_prevents_new_actions():
     assert svc.start("help")["error"]["code"] == "ASSISTANT_CLOSED"
 
 
+def test_question_is_answered_while_lesson_remains_running_and_both_turns_survive():
+    tracker = RunTracker()
+    assistant = HalcyonAssistant(client=MagicMock())
+    child_ids, question_history = [], []
+
+    def command(_text, parent, timeout):
+        child, _ = tracker.create_run(
+            command="/coach teach", source="llm", timeout_s=timeout, parent_run_id=parent
+        )
+        tracker.mark_running(child)
+        child_ids.append(child)
+        return 202, tracker.get_status(child)
+
+    def ask(goal, *, control, history, **_kwargs):
+        if goal == "teach Avril":
+            outcome = control("run_slash_command", {"command": '/coach teach "Avril"'})
+            return AssistantResult("Demonstration ended.", [outcome])
+        question_history.extend(history)
+        assert tracker.get_status(child_ids[0])["status"] == "running"
+        assert control("get_app_state", {})["audio"]["ready"]
+        return AssistantResult("Use your right hand for this melody.")
+
+    assistant.ask = ask
+    svc = service(assistant, tracker, command)
+    first = svc.start("teach Avril")
+    first_worker = svc._worker
+    try:
+        with svc._foreground:
+            assert svc._foreground.wait_for(lambda: svc._active_run_id is None, timeout=1)
+        question = svc.start("Which hand?", session_id=first["session_id"])
+        assert question["started"]
+        assert finish(svc, question)["status"] == "completed"
+        assert tracker.get_status(first["run_id"])["status"] == "running"
+        assert any(item["content"] == "teach Avril" for item in question_history)
+        assert any("still running" in item["content"] for item in question_history)
+    finally:
+        for child in child_ids:
+            tracker.mark_completed(child, success=True, result={"ok": True})
+        first_worker.join(timeout=2)
+    assert not first_worker.is_alive()
+    assert tracker.get_status(first["run_id"])["status"] == "completed"
+    history = str(svc._sessions[first["session_id"]])
+    assert "Which hand?" in history
+    assert "Use your right hand" in history
+    assert "Demonstration ended" in history
+
+
+@pytest.mark.parametrize(
+    "goal", ["stop", "Please stop!", "Can you stop the lesson?", "stop playing"]
+)
+def test_stop_bypasses_inflight_model_and_blocks_its_late_actions(goal):
+    entered, release = Event(), Event()
+    client = MagicMock()
+
+    def model(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "run_slash_command",
+                    "call_id": "late",
+                    "arguments": '{"command": "/coach replay"}',
+                }
+            ],
+        }
+
+    client.responses.create.side_effect = model
+    tracker = RunTracker()
+    commands = []
+
+    def command(text, parent, timeout):
+        commands.append(text)
+        child, _ = tracker.create_run(
+            command=text, source="llm", parent_run_id=parent, timeout_s=timeout
+        )
+        tracker.mark_completed(
+            child,
+            success=True,
+            result={
+                "ok": True,
+                "code": "COACH_STOPPED",
+                "message": "Coach stopped and voices released.",
+            },
+        )
+        return 200, tracker.get_status(child)
+
+    svc = service(HalcyonAssistant(client=client), tracker, command)
+    first = svc.start("teach Avril")
+    first_worker = svc._worker
+    assert entered.wait(timeout=1)
+    try:
+        stop = svc.start(goal, session_id=first["session_id"])
+        assert stop["started"]
+        result = finish(svc, stop)
+        assert result["status"] == "completed"
+        assert "voices released" in result["result"]["reply"]
+        assert tracker.get_status(first["run_id"])["status"] == "cancelled"
+        client.responses.create.assert_called_once()
+    finally:
+        release.set()
+        first_worker.join(timeout=2)
+    assert not first_worker.is_alive()
+    assert commands == ["/coach stop"]
+    assert svc._active_run_id is None
+
+
+@pytest.mark.parametrize(
+    "goal", ["don't stop", "How do I stop?", "What does stop do?", "stop being so vague"]
+)
+def test_mentions_of_stop_are_not_treated_as_stop_requests(goal):
+    assistant = HalcyonAssistant(client=MagicMock())
+    assistant.ask = MagicMock(return_value=AssistantResult("An answer."))
+    svc = service(assistant)
+    assert finish(svc, svc.start(goal))["status"] == "completed"
+    assistant.ask.assert_called_once()
+    svc._command.assert_not_called()
+
+
+def test_stop_failure_is_reported_without_a_model_or_claiming_audio_stopped():
+    assistant = HalcyonAssistant(api_key="")
+    svc = service(
+        assistant,
+        command=MagicMock(
+            return_value=(
+                400,
+                {"ok": False, "error": {"code": "STOP_FAILED", "message": "Stop failed."}},
+            )
+        ),
+    )
+    result = finish(svc, svc.start("please stop"))
+    assert result["status"] == "failed"
+    assert result["result"]["stopped_reason"] == "stop_failed"
+    assert "STOP_FAILED" in result["result"]["reply"]
+    svc._command.assert_called_once()
+
+
+def test_stop_interrupts_waiting_lesson_without_waiting_for_its_terminal_result():
+    tracker = RunTracker()
+    assistant = HalcyonAssistant(client=MagicMock())
+    children, commands = [], []
+
+    def command(text, parent, timeout):
+        commands.append(text)
+        child, _ = tracker.create_run(
+            command=text, source="llm", timeout_s=timeout, parent_run_id=parent
+        )
+        tracker.mark_running(child)
+        if text == "/coach stop":
+            tracker.mark_cancelled(children[0])
+            tracker.mark_completed(child, success=True, result={"ok": True, "message": "Stopped."})
+        else:
+            children.append(child)
+        return 202, tracker.get_status(child)
+
+    def ask(_goal, *, control, **_kwargs):
+        outcome = control("run_slash_command", {"command": "/coach replay"})
+        return AssistantResult("Playback ended.", [outcome])
+
+    assistant.ask = MagicMock(side_effect=ask)
+    svc = service(assistant, tracker, command)
+    first = svc.start("replay")
+    first_worker = svc._worker
+    try:
+        with svc._foreground:
+            assert svc._foreground.wait_for(lambda: svc._active_run_id is None, timeout=1)
+        stop = svc.start("stop", session_id=first["session_id"])
+        assert finish(svc, stop)["status"] == "completed"
+        assert tracker.get_status(first["run_id"])["status"] == "cancelled"
+        assert tracker.get_status(children[0])["status"] == "cancelled"
+        assistant.ask.assert_called_once()
+        assert commands == ["/coach replay", "/coach stop"]
+    finally:
+        svc.close()
+        first_worker.join(timeout=2)
+    assert not first_worker.is_alive()
+
+
+def test_lesson_completion_waits_for_foreground_question_before_model_continuation():
+    tracker = RunTracker()
+    assistant = HalcyonAssistant(client=MagicMock())
+    question_entered, release_question, lesson_returned, terminal_observed = (
+        Event(),
+        Event(),
+        Event(),
+        Event(),
+    )
+    children = []
+    original_wait = tracker.wait_for_run
+
+    def wait(child, **kwargs):
+        result = original_wait(child, **kwargs)
+        if result and result.get("terminal"):
+            terminal_observed.set()
+        return result
+
+    tracker.wait_for_run = wait
+
+    def command(text, parent, timeout):
+        child, _ = tracker.create_run(
+            command=text, source="llm", timeout_s=timeout, parent_run_id=parent
+        )
+        tracker.mark_running(child)
+        children.append(child)
+        return 202, tracker.get_status(child)
+
+    def ask(goal, *, control, **_kwargs):
+        if goal == "replay":
+            control("run_slash_command", {"command": "/coach replay"})
+            lesson_returned.set()
+            return AssistantResult("Playback completed.")
+        question_entered.set()
+        assert release_question.wait(timeout=2)
+        return AssistantResult("Question answered.")
+
+    assistant.ask = ask
+    svc = service(assistant, tracker, command)
+    first = svc.start("replay")
+    first_worker = svc._worker
+    try:
+        with svc._foreground:
+            assert svc._foreground.wait_for(lambda: svc._active_run_id is None, timeout=1)
+        question = svc.start("How do I play this?", session_id=first["session_id"])
+        assert question_entered.wait(timeout=1)
+        tracker.mark_completed(children[0], success=True, result={"ok": True})
+        assert terminal_observed.wait(timeout=1)
+        assert not lesson_returned.is_set()
+        assert svc._active_run_id == question["run_id"]
+        release_question.set()
+        assert finish(svc, question)["status"] == "completed"
+    finally:
+        release_question.set()
+        if not terminal_observed.is_set():
+            svc.close()
+        first_worker.join(timeout=2)
+    assert not first_worker.is_alive()
+    assert lesson_returned.is_set()
+    assert tracker.get_status(first["run_id"])["status"] == "completed"
+
+
 def test_typed_request_progress_and_reply_have_one_emitter_and_existing_identity():
     assistant = HalcyonAssistant(api_key="private-key-marker", client=MagicMock())
     tracker = RunTracker()

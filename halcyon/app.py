@@ -1786,6 +1786,9 @@ class HalcyonApp(App[None]):
         except CommandExecutionError as exc:
             return 400, {"error": str(exc)}
 
+        if invocation.leaf_command in {"/coach stop", "/panic"}:
+            self.assistant_service.interrupt(except_run_id=parent_run_id)
+
         if invocation.tool == "ask_assistant":
             if parent_run_id is not None:
                 return 400, {"error": "Recursive assistant calls are not allowed."}

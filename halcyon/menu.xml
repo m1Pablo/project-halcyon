@@ -5,9 +5,10 @@
             shortcut="ask"
             tool="ask_assistant"
             usage="/assistant ask &quot;GOAL&quot; [--session-id ID]"
-            description="Discuss music or delegate a goal to the assistant; retain the returned session_id for follow-ups"
+            description="Discuss music, including during playback; say stop to interrupt. Retain the returned session_id for follow-ups"
             mcp_concurrency_group="assistant"
-            mcp_parallel_ok="false"
+            mcp_single_flight="false"
+            mcp_parallel_ok="true"
             mcp_poll_after_s="1"
         />
     </option>

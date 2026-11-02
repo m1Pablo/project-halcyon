@@ -3,21 +3,38 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import re
 import threading
 import time
 from typing import Any, Callable
 import uuid
 
 from halcyon.assistant import (
+    AssistantResult,
     HalcyonAssistant,
     MAX_ASSISTANT_HISTORY_ENTRIES,
     MAX_ASSISTANT_HISTORY_TEXT,
+    render_command_terminal,
 )
 from halcyon.console_events import ConsoleEvent
 from halcyon.mcp_local.run_tracker import RunTracker, TERMINAL_RUN_STATES
 
 MAX_SESSIONS = 32
 MAX_WALL_S = 600.0
+
+
+def _stop_requested(goal: str) -> bool:
+    """Recognize explicit stop requests without routing them through a model."""
+    return (
+        re.fullmatch(
+            r"(?:please |(?:can|could|would) you (?:please )?)?"
+            r"(?:stop(?: (?:it|now|playing|playback|the (?:lesson|music|playback)))?"
+            r"|cancel(?: the lesson)?)"
+            r"(?: please)?[.!?]*",
+            " ".join(goal.casefold().split()),
+        )
+        is not None
+    )
 
 
 class AssistantService:
@@ -39,13 +56,25 @@ class AssistantService:
         self._event_sink = event_sink
         self._sessions: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
         self._lock = threading.RLock()
+        self._foreground = threading.Condition(self._lock)
         self._worker: threading.Thread | None = None
+        self._workers: dict[str, threading.Thread] = {}
         self._active_run_id: str | None = None
         self._closed = threading.Event()
 
     def close(self) -> None:
         """Prevent further model turns and actions; do not wait on an in-flight API call."""
         self._closed.set()
+
+    def interrupt(self, *, except_run_id: str | None = None) -> None:
+        """Prevent old assistant turns from issuing actions after an explicit stop."""
+        with self._foreground:
+            for run_id in self._workers:
+                if run_id != except_run_id:
+                    self.tracker.mark_cancelled(run_id, error="Interrupted by your stop request.")
+            if self._active_run_id != except_run_id:
+                self._active_run_id = None
+            self._foreground.notify_all()
 
     def start(
         self, goal: str, *, session_id: str | None = None, source: str = "llm"
@@ -64,13 +93,14 @@ class AssistantService:
                     "started": False,
                     "error": {"code": "ASSISTANT_CLOSED", "message": "The app is closing."},
                 }
-            if self._worker is not None and self._worker.is_alive():
+            stop_requested = _stop_requested(goal)
+            if self._active_run_id is not None and not stop_requested:
                 return {
                     "started": False,
                     "active_run_id": self._active_run_id,
                     "error": {
                         "code": "ASSISTANT_BUSY",
-                        "message": "An assistant request is still active. Wait for that run. Use /coach stop or /panic for immediate audio control.",
+                        "message": "An assistant response is still being prepared. Try again shortly. Say 'stop' or use /coach stop for immediate playback control.",
                     },
                 }
             if session_id is not None and session_id not in self._sessions:
@@ -84,6 +114,8 @@ class AssistantService:
             session_id = session_id or uuid.uuid4().hex
             goal = self.assistant.safe_text(goal)
             history = list(self._sessions.get(session_id, []))
+            if stop_requested:
+                self.interrupt()
             run_id, _ = self.tracker.create_run(
                 command="/assistant ask", source=source, timeout_s=MAX_WALL_S, session_id=session_id
             )
@@ -97,10 +129,11 @@ class AssistantService:
             self._active_run_id = run_id
             self._worker = threading.Thread(
                 target=self._work,
-                args=(run_id, session_id, goal, history, source),
+                args=(run_id, session_id, goal, history, source, stop_requested),
                 name="halcyon-assistant-agent",
                 daemon=True,
             )
+            self._workers[run_id] = self._worker
             self._worker.start()
             return {
                 "started": True,
@@ -108,6 +141,20 @@ class AssistantService:
                 "session_id": session_id,
                 "status": "running",
             }
+
+    def _append_history(self, session_id: str, role: str, text: str) -> None:
+        with self._lock:
+            history = self._sessions.setdefault(session_id, [])
+            history.append(
+                {
+                    "role": role,
+                    "content": self.assistant.safe_text(text, limit=MAX_ASSISTANT_HISTORY_TEXT),
+                }
+            )
+            self._sessions[session_id] = history[-MAX_ASSISTANT_HISTORY_ENTRIES:]
+            self._sessions.move_to_end(session_id)
+            while len(self._sessions) > MAX_SESSIONS:
+                self._sessions.popitem(last=False)
 
     def _show(
         self,
@@ -152,8 +199,16 @@ class AssistantService:
         goal: str,
         history: list[dict[str, str]],
         source: str,
+        stop_requested: bool = False,
     ) -> None:
         deadline = time.monotonic() + MAX_WALL_S
+        request_recorded = False
+
+        def record_request() -> None:
+            nonlocal request_recorded
+            if not request_recorded:
+                self._append_history(session_id, "user", goal)
+                request_recorded = True
 
         def show(kind: str, text: str, status: str = "running") -> None:
             self._show(
@@ -201,20 +256,45 @@ class AssistantService:
             if not child_id:
                 return result
             cursor = 0
-            while result.get("status") not in TERMINAL_RUN_STATES:
-                if stopped():
-                    # Request timeout cleanup only for this assistant's child operation.
-                    self.tracker.mark_timeout(child_id)
-                    return {
-                        "ok": False,
-                        "run_id": child_id,
-                        "error": "Assistant stopped; child cleanup was requested. Inspect its run before retrying.",
-                    }
-                result = self.tracker.wait_for_run(child_id, cursor=cursor, max_wait_s=0.2) or {
-                    "status": "failed",
-                    "error": "Child run was lost.",
-                }
-                cursor = result.get("next_cursor", cursor)
+            if result.get("status") not in TERMINAL_RUN_STATES:
+                record_request()
+                self._append_history(
+                    session_id,
+                    "assistant",
+                    f"Started {result.get('command', 'a command')}; run {child_id} is still running. "
+                    "You can ask questions or stop playback while it runs.",
+                )
+                with self._foreground:
+                    if self._active_run_id == run_id:
+                        self._active_run_id = None
+                        self._foreground.notify_all()
+                try:
+                    while result.get("status") not in TERMINAL_RUN_STATES:
+                        if stopped():
+                            parent = self.tracker.get_status(run_id) or {}
+                            if self._closed.is_set() or parent.get("status") == "cancelled":
+                                self.tracker.mark_cancelled(child_id)
+                            else:
+                                self.tracker.mark_timeout(child_id)
+                            return {
+                                "ok": False,
+                                "run_id": child_id,
+                                "error": "Assistant stopped; child cleanup was requested. Inspect its run before retrying.",
+                            }
+                        result = self.tracker.wait_for_run(
+                            child_id, cursor=cursor, max_wait_s=0.2
+                        ) or {
+                            "status": "failed",
+                            "error": "Child run was lost.",
+                        }
+                        cursor = result.get("next_cursor", cursor)
+                finally:
+                    # Only one conversational model turn owns command dispatch at a time.
+                    with self._foreground:
+                        while self._active_run_id not in (None, run_id) and not stopped():
+                            self._foreground.wait(timeout=0.2)
+                        if not stopped():
+                            self._active_run_id = run_id
             result = {
                 key: result[key]
                 for key in ("run_id", "status", "result", "error", "command", "parent_run_id")
@@ -225,9 +305,25 @@ class AssistantService:
             return result
 
         try:
-            result = self.assistant.ask(
-                goal, control=control, history=history, stopped=stopped, progress=progress
-            )
+            if stop_requested:
+                outcome = control("run_slash_command", {"command": "/coach stop"})
+                result = AssistantResult(
+                    render_command_terminal(outcome.get("result", outcome)),
+                    [
+                        {
+                            "tool": "run_slash_command",
+                            "leaf": "/coach stop",
+                            "run_id": outcome.get("run_id"),
+                            "status": outcome.get("status"),
+                            "ok": outcome.get("ok", False),
+                        }
+                    ],
+                    stopped_reason=None if outcome.get("ok") else "stop_failed",
+                )
+            else:
+                result = self.assistant.ask(
+                    goal, control=control, history=history, stopped=stopped, progress=progress
+                )
             public = {
                 "ok": result.stopped_reason is None,
                 "reply": self.assistant.safe_text(result.text),
@@ -245,24 +341,12 @@ class AssistantService:
                 )
                 return
             # History records actual outcomes, not just the earlier plan.
-            exchange = [
-                {
-                    "role": "user",
-                    "content": self.assistant.safe_text(goal, limit=MAX_ASSISTANT_HISTORY_TEXT),
-                },
-                {
-                    "role": "assistant",
-                    "content": self.assistant.safe_text(
-                        result.text + "\nStep outcomes: " + str(result.tool_results),
-                        limit=MAX_ASSISTANT_HISTORY_TEXT,
-                    ),
-                },
-            ]
-            with self._lock:
-                self._sessions[session_id] = (history + exchange)[-MAX_ASSISTANT_HISTORY_ENTRIES:]
-                self._sessions.move_to_end(session_id)
-                while len(self._sessions) > MAX_SESSIONS:
-                    self._sessions.popitem(last=False)
+            record_request()
+            self._append_history(
+                session_id,
+                "assistant",
+                result.text + "\nStep outcomes: " + str(result.tool_results),
+            )
             if result.stopped_reason:
                 settled = self.tracker.mark_failed(
                     run_id, error=result.stopped_reason, result=public
@@ -283,3 +367,9 @@ class AssistantService:
             settled = self.tracker.mark_failed(run_id, error=error)
             if settled:
                 show("reply", error, "failed")
+        finally:
+            with self._foreground:
+                self._workers.pop(run_id, None)
+                if self._active_run_id == run_id:
+                    self._active_run_id = None
+                self._foreground.notify_all()

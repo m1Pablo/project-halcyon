@@ -84,10 +84,11 @@ def test_plan_canonical_note_on_constructs_as_press_audio_and_active_bus_voice()
     dispatched = bus.publish(event).event
 
     assert dispatched.is_press and dispatched.midi_event_type == "note_on"
+    assert dispatched.velocity == 100
     assert audio_command_for_event(dispatched) == {
         "type": "note_on",
         "note": 60,
-        "velocity": 100,
+        "velocity": 50,
         "channel": 1,
         "voice_id": event.voice_id,
     }

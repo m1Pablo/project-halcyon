@@ -52,7 +52,7 @@ def test_mcp_attrs_are_loaded_from_xml() -> None:
         assert payloads[command]["mcp_concurrency_group"] == "coach_session"
         assert payloads[command].get("mcp_single_flight", True) is True
     assert payloads["/coach feedback"]["mcp_concurrency_group"] == "coach_session"
-    for command in ("/coach feedback", "/coach state", "/coach stop"):
+    for command in ("/assistant ask", "/coach feedback", "/coach state", "/coach stop"):
         assert payloads[command]["mcp_single_flight"] is False
         assert payloads[command]["mcp_parallel_ok"] is True
     assert payloads["/panic"]["mcp_single_flight"] is False

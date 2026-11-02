@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 from urllib import error, request
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -18,6 +19,7 @@ def _fake_halcyon_app() -> HalcyonApp:
     app = object.__new__(HalcyonApp)
     app.menu_def = load_menu()
     app._run_tracker = RunTracker()
+    app.assistant_service = SimpleNamespace(interrupt=MagicMock())
     app.calls = []
     # This fixture exercises command authority, not mounted console presentation.
     app._remember_console_run = lambda *_args: None
@@ -46,6 +48,16 @@ def test_app_mcp_run_slash_dispatches_through_command_executor() -> None:
     assert app.calls == [("set_synth_param", {"param": "tone", "value": 0.7})]
 
 
+def test_command_listing_advertises_chat_during_lesson_playback():
+    app = _fake_halcyon_app()
+    command = next(
+        item for item in app.mcp_local_list_commands() if item["command"] == "/assistant ask"
+    )
+    assert command["parallel_ok"] is True
+    assert command["single_flight"] is False
+    assert "during playback" in command["description"]
+
+
 def test_ended_assistant_cannot_dispatch_a_queued_mutation():
     app = _fake_halcyon_app()
     app._closing = False
@@ -57,6 +69,26 @@ def test_ended_assistant_cannot_dispatch_a_queued_mutation():
     assert code == 409
     assert "ended" in result["error"]
     assert app.calls == []
+
+
+@pytest.mark.parametrize("command", ["/coach stop", "/panic"])
+@pytest.mark.parametrize("has_parent", [False, True])
+def test_stop_commands_interrupt_other_assistant_turns_before_dispatch(command, has_parent):
+    app = _fake_halcyon_app()
+    app._closing = False
+    parent = None
+    if has_parent:
+        parent, _ = app._run_tracker.create_run(command="/assistant ask", source="llm")
+        app._run_tracker.mark_running(parent)
+
+    def execute(_name, _arguments):
+        app.assistant_service.interrupt.assert_called_once_with(except_run_id=parent)
+        return {"ok": True}
+
+    app._execute_tool_from_worker = execute
+    code, result = app.mcp_local_run_slash(command=command, source="codex", parent_run_id=parent)
+    assert code == 200
+    assert result["status"] == "completed"
 
 
 def test_app_mcp_run_slash_deduplicates_active_single_flight_group() -> None:
