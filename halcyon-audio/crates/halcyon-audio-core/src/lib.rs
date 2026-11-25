@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 
+pub mod score;
+
 pub const DEFAULT_POLYPHONY: usize = 8;
 const OUTPUT_CEILING: f32 = 0.88;
 
